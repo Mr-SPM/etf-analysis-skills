@@ -135,19 +135,30 @@ def append_live_snapshot(day: str, rows: list[dict], label: str = "") -> dict:
     }
 
 
-# 收盘时间: A 股 15:00 收盘。留 5 分钟缓冲, 15:05 之后的实时行情视为"已定格"。
-MARKET_CLOSE = datetime.strptime("15:05", "%H:%M").time()
+# 月度数据落库时间: 月度走势接口每天 16:00 才写入当日数据。
+#
+# 这个阈值不是"收盘时间", 而是**月度数据可供替代实时数据的时间点**:
+#   - 15:00      A 股收盘, 行情已定格, 但月度数据尚未包含今天
+#   - 15:00-16:00  尴尬窗口: 行情已定格, 月度数据却还没有今天的数据
+#                  -> 此时仍需要实时/快照数据, 否则当天行情会缺失
+#   - >= 16:00   月度数据已含当日行情 -> 实时数据非必要, 可直接跳过
+#
+# 故阈值取 16:01 (16:00 落库 + 1 分钟缓冲, 避开落库瞬间的边界)。
+MONTH_READY = datetime.strptime("16:01", "%H:%M").time()
 
 
-def is_market_closed(now: datetime | None = None) -> bool:
-    """当日是否已收盘 (超过 15:05)。
+def month_data_ready(now: datetime | None = None) -> bool:
+    """月度数据是否已落库当日行情 (>= 16:01)。
 
-    收盘后实时行情不再变化, 继续调接口纯属浪费, 应直接复用当日快照。
+    注意含义不是"收盘" —— 而是**月度数据已可替代实时数据**。
+    15:00-16:00 之间行情虽已定格, 但月度数据仍缺当日, 故仍需实时数据
+    兜住当天的记录。
+
     注意: 这里不判断周末/节假日 —— 非交易日接口同样返回静态数据,
-    复用快照即可, 行为等价且更省。
+    行为等价且更省。
     """
     now = now or datetime.now()
-    return now.time() >= MARKET_CLOSE
+    return now.time() >= MONTH_READY
 
 
 def latest_snapshot_age(day: str) -> tuple[dict | None, float | None]:
@@ -630,7 +641,7 @@ def score_etfs(rows: list[dict], min_amount: float = 5e7) -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="A股 ETF 数据采集器")
     ap.add_argument("--out", required=True, help="输出 JSON 路径")
-    ap.add_argument("--month", default="", help="月度走势月份 YYYY-MM, 默认上月")
+    ap.add_argument("--month", default="", help="月度走势月份 YYYY-MM, 默认当月")
     ap.add_argument(
         "--days",
         type=int,
@@ -689,7 +700,11 @@ def main() -> int:
     ap.add_argument(
         "--refresh-live",
         action="store_true",
-        help="强制重新拉取实时数据, 忽略收盘判断与 TTL 阈值",
+        help=(
+            "强制重新拉取实时数据, 跳过「月度已落库则跳过实时」与 TTL 判断。"
+            "注意: 16:00 后月度数据已含当日行情, 加此参数只会在网络受限时"
+            "超时失败。默认不要使用。"
+        ),
     )
     args = ap.parse_args()
 
@@ -722,44 +737,73 @@ def main() -> int:
     today = datetime.now().strftime("%Y-%m-%d")
 
     # --- 数据源 1: 实时行情 ---
-    # 拉取前的三道闸门 (依次判断, 任一命中即复用快照, 不调接口):
-    #   1. --use-live-cache 显式要求复用
-    #   2. 已收盘 (>= 15:05): 行情定格, 再调也无变化
-    #   3. 距上次快照 < --live-ttl 分钟 (默认 10): 连续对话场景避免重复拉取
-    # 用 --refresh-live 可强制跳过 2、3 两道闸门。
-    if not args.skip_live:
-        snap_info = None
-        reuse_reason = None
-        last_snap = None
+    # 实时行情的取舍逻辑 (按时间段区分, 而不是"尽量少调"):
+    #
+    #   16:01 前:  实时接口**必要** —— 分两种情况:
+    #              a) 盘中 (< 15:00): 当日行情还在变
+    #              b) 15:00-16:00: 行情已定格, 但**月度数据尚未落库当日行情**
+    #                 (月度数据 16:00 才写入), 此时跳过会丢失当天记录
+    #   >= 16:01:  实时接口**不必要, 直接跳过** —— 月度数据已含当日全部行情
+    #              (含当日 daily_return), 再调实时接口是拿一个已经在手边的数据
+    #
+    # 16:01 后跳过是**正当行为**, 不是降级、不是妥协。若当日已有快照则顺带复用,
+    # 作为补充信息 (可选), 但绝不因缺少实时数据而失败。
+    skip_live_due_close = not args.refresh_live and month_data_ready()
 
-        if not args.refresh_live:
-            last_snap, age_min = latest_snapshot_age(today)
-
-            if args.use_live_cache and last_snap:
-                reuse_reason = "--use-live-cache"
-                detail = "显式要求复用当日快照"
-            elif last_snap and is_market_closed():
-                reuse_reason = "已收盘"
-                detail = (
-                    f"当前已过 15:05 收盘时间, 行情已定格, "
-                    f"直接复用 {last_snap.get('time')} 的快照"
-                )
-            elif last_snap and age_min is not None and age_min < args.live_ttl:
-                reuse_reason = "TTL 内"
-                detail = (
-                    f"距上次采集({last_snap.get('time')})仅 {age_min:.1f} 分钟 "
-                    f"< {args.live_ttl} 分钟阈值, 数据仍新鲜"
-                )
-
-        if reuse_reason:
+    if not args.skip_live and skip_live_due_close:
+        # 月度数据已落库: 优先复用当日快照作为补充, 没有也完全不影响分析
+        last_snap, _age = latest_snapshot_age(today)
+        if last_snap:
             live = last_snap.get("rows") or []
             result["sources"]["live"] = {
                 "ok": True,
                 "count": len(live),
-                "via": f"复用快照 ({reuse_reason})",
+                "via": "月度已落库, 复用快照 (实时非必要)",
                 "snapshot_time": last_snap.get("time"),
             }
-            result["warnings"].append(f"实时行情未重新拉取: {detail}。")
+            result["warnings"].append(
+                f"已过 16:00, 月度数据已含当日行情, 实时数据非必要, "
+                f"复用 {last_snap.get('time')} 的当日快照作为补充。"
+            )
+        else:
+            result["sources"]["live"] = {
+                "ok": True,
+                "count": 0,
+                "via": "月度已落库, 跳过实时 (实时非必要)",
+            }
+            result["warnings"].append(
+                "已过 16:00, 月度数据已含当日行情, 实时接口非必要, 已跳过。"
+                "当日行情完整包含在月度数据 (series) 中, 不影响分析。"
+            )
+
+    elif not args.skip_live:
+        # 盘中: 实时数据必要, 依次过三道闸门 (任一命中即复用, 不调接口)
+        #   1. --use-live-cache 显式要求复用
+        #   2. 距上次快照 < --live-ttl 分钟 (默认 10): 连续对话避免重复拉取
+        snap_info = None
+        last_snap, age_min = latest_snapshot_age(today)
+
+        if args.use_live_cache and last_snap:
+            live = last_snap.get("rows") or []
+            result["sources"]["live"] = {
+                "ok": True,
+                "count": len(live),
+                "via": "复用快照 (--use-live-cache)",
+                "snapshot_time": last_snap.get("time"),
+            }
+            result["warnings"].append("实时行情未重新拉取: 显式要求复用当日快照。")
+        elif last_snap and age_min is not None and age_min < args.live_ttl:
+            live = last_snap.get("rows") or []
+            result["sources"]["live"] = {
+                "ok": True,
+                "count": len(live),
+                "via": "复用快照 (TTL 内)",
+                "snapshot_time": last_snap.get("time"),
+            }
+            result["warnings"].append(
+                f"实时行情未重新拉取: 距上次采集({last_snap.get('time')})仅 "
+                f"{age_min:.1f} 分钟 < {args.live_ttl} 分钟阈值, 数据仍新鲜。"
+            )
 
         if not live:
             live, err = fetch_live(cookie)
@@ -778,7 +822,7 @@ def main() -> int:
                     )
 
         # 当日多次调用 -> 自动对比首条与最新快照
-        if args.snapshot and not args.skip_live:
+        if args.snapshot:
             snaps = load_live_snapshots(today)
             if len(snaps) >= 2:
                 d = diff_snapshots(snaps[0], snaps[-1])

@@ -17,8 +17,8 @@
 python install.py
 ```
 
-脚本会自动完成四项检查（Python 版本、源码完整性、数据源连通性、端到端自检）
-并安装到 `~/.workbuddy-ai/skills/etf-analysis`。
+脚本会做两项部署前检查（Python 版本、源码完整性）并安装到
+`~/.workbuddy-ai/skills/etf-analysis`。
 
 安装到其他位置：
 
@@ -31,6 +31,16 @@ python install.py --dest /path/to/skills
 ```bash
 python install.py --check
 ```
+
+体检数据源连通性（可选，与安装无关）：
+
+```bash
+python install.py --doctor
+```
+
+> 安装脚本**刻意不检查数据源连通性**。连通性属于运行时状态，受代理、防火墙、
+> 对端服务重启影响，与安装是否成功没有因果关系；采集脚本本身已具备自动降级
+> 能力，因此把连通性检查放进安装流程只会产生虚假失败信号。
 
 ## 手动安装
 
@@ -68,7 +78,7 @@ python scripts/build_prompt.py --data etf_data.json \
 |---|---|
 | `--month YYYY-MM` | 指定月份，默认当月 |
 | `--days N` | 月度窗口天数，默认 15 |
-| `--refresh-live` | 强制重新拉取实时数据（忽略收盘判断与 TTL） |
+| `--refresh-live` | 强制重新拉取实时数据（跳过「月度已落库则跳过实时」与 TTL 判断） |
 | `--live-ttl MIN` | 实时数据新鲜度阈值，默认 10 分钟 |
 | `--refresh-month` | 忽略月度缓存，强制重拉 |
 | `--save-cache` | 把月度走势写入缓存 |
@@ -77,13 +87,16 @@ python scripts/build_prompt.py --data etf_data.json \
 
 ## 数据源
 
-| 来源 | 接口 | 认证 |
-|---|---|---|
-| 实时行情 | `my-stock.918968.xyz/all` | 可选 cookie |
-| 月度走势 | `stock2.1168168.xyz/api/etf/month` | Clerk JWT（60 秒有效） |
-| 月度走势（兜底） | `stock2.1168168.xyz/api/etf/series` | 无需认证 |
+本技能依赖两个外部数据接口（实时行情 + 月度走势），具体地址、认证方式与返回
+结构统一记录在 **`ENDPOINTS.md`**，本文不再重复。
 
-认证接口通常用不上 —— 公开的 `series` 接口返回等价数据，脚本会自动降级。
+> ⚠️ `ENDPOINTS.md` 含真实接口地址，请勿提交到公开仓库或对外分享。
+
+接口行为要点（不含地址）：
+
+- 实时行情：可选 cookie，失败时可手动提供
+- 月度走势：走 Clerk JWT 认证，**有效期仅 60 秒**
+- 月度走势兜底：存在一个公开接口，认证接口失败时脚本自动降级使用，数据等价
 
 ## 数据存放位置
 

@@ -1,0 +1,14 @@
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 采集产物
+etf_data.json
+prompt.md
+analysis_prompt.md
+
+# 编辑器
+.vscode/
+.idea/
