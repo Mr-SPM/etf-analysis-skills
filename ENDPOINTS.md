@@ -1,7 +1,6 @@
 # 数据源接口清单
 
 > 本文件包含真实接口地址，**不要提交到公开仓库，也不要对外分享**。
-> 当前接口未做鉴权加固，暴露地址等于开放数据消费权限。
 
 ## 实时行情
 
@@ -13,44 +12,39 @@
 | 返回 | 1600+ 只 ETF 实时行情 |
 | 字段 | `symbol`, `name`, `current`, `percent`, `chg`, `amount`, `volume`, `premium_rate`, `unit_nav`, `acc_unit_nav`, `market_capital`, `followers`, `current_year_percent`, `total_shares`, `etf_types` |
 
-## 月度走势（需认证）
+## 走势数据（API Key 认证）
 
 | 项 | 值 |
 |---|---|
-| 地址 | `https://stock2.1168168.xyz/api/etf/month?month=YYYY-MM&days=15` |
+| 地址 | `https://stock2.1168168.xyz/api/etf/month` |
 | 方法 | `GET` |
-| 认证 | `Authorization: Bearer <Clerk session JWT>`（**必需**） |
-| 返回 | `{success, data: { <bucket>: [ {symbol, name, series:[...]} ] }}` |
-| series 字段 | `trade_date`, `cumulative_return`, `daily_return` |
-| 备注 | JWT 有效期仅 **60 秒**（`exp - iat = 60`），必须取到后立刻使用 |
+| 认证 | `Authorization: Bearer etf_xxxxxxxx...`（**必需**，`etf_` + 64 位十六进制） |
+| 参数 | `days=15` 优先；`month=YYYY-MM` 次之（**传了 days 则 month 被忽略**） |
+| 返回 | `{success, data: { "<trade_date>": [ {symbol, name, percent} ] }}` |
+| 字段 | `percent` 为百分数（1.25 = +1.25%） |
+| Key 获取 | 登录站点 → 用户菜单 → 「API Key 管理」→ 生成 |
 
-## 月度走势（公开兜底）
+**`days` 是自然日**（跨月连续），不是交易日。`days=15` 即最近 15 个自然日。
+脚本默认 `days=15`，用户指定「30 天内」时传 `--days 30`。
 
-| 项 | 值 |
-|---|---|
-| 地址 | `https://stock2.1168168.xyz/api/etf/series?month=YYYY-MM&days=15` |
-| 方法 | `GET` |
-| 认证 | **无需认证** |
-| 返回 | 结构与 `month` 完全一致 |
-
-`month` 接口返回 401 时，采集脚本会自动降级到 `series`，数据等价。
+Key 存明文、永久有效，但可在网站上吊销；吊销后接口返回 401。
 
 ## 其他
 
 | 用途 | 值 |
 |---|---|
 | 站点 Referer | `https://stock2.1168168.xyz/`（接口对此敏感，脚本已带上） |
-| Clerk Publishable Key | `pk_live_Y2xlcmsuMTE2ODE2OC54eXok` |
-| Clerk Frontend API | `https://clerk.1168168.xyz` |
+| API Key 管理页 | `https://stock2.1168168.xyz/settings/apikey` |
 | 登录入口 | `https://stock2.1168168.xyz/` |
-| 取 token 方式 | 登录后在浏览器控制台执行 `await window.Clerk.session.getToken()` |
 
 ## 代码中对应的常量
 
 `scripts/fetch_etf.py` 顶部集中定义了这些地址，改地址只需改这一处：
 
 ```python
-LIVE_URL   = "https://my-stock.918968.xyz/all"
-MONTH_URL  = "https://stock2.1168168.xyz/api/etf/month"
-SERIES_URL = "https://stock2.1168168.xyz/api/etf/series"
+LIVE_URL         = "https://my-stock.918968.xyz/all"
+MONTH_URL        = "https://stock2.1168168.xyz/api/etf/month"
+API_KEY_PREFIX   = "etf_"
+DEFAULT_DAYS     = 15
+APIKEY_PAGE_HINT = "https://stock2.1168168.xyz/settings/apikey"
 ```

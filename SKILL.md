@@ -1,8 +1,9 @@
 ---
 name: etf-analysis
 description: >
-  A股 ETF 数据分析助手。调用两个接口获取实时行情与月度走势数据，合并后按可编辑的
+  A股 ETF 数据分析助手。调用两个接口获取实时行情与走势数据，合并后按可编辑的
   提示词模板生成交易分析（走势判断、值得关注的类型、买入建议、止盈止损、风险提示）。
+  默认取最近 15 天走势，用户说「获取 30 天内的 ETF 数据」这类需求时用 --days 调整。
   触发词：ETF分析、A股ETF、ETF走势、ETF持仓分析、分析我的ETF、etf analyse、
   ETF买卖建议、ETF止盈止损。
 agent_created: true
@@ -17,31 +18,60 @@ agent_created: true
 | 来源 | 接口 | 认证 | 内容 |
 |---|---|---|---|
 | 实时行情 | `https://my-stock.918968.xyz/all` | 可选 cookie | 1600+ 只 ETF 实时价、涨幅、成交额、溢价率、净值 |
-| 月度走势 | `https://stock2.1168168.xyz/api/etf/month?month=YYYY-MM&days=15` | **必需** Clerk JWT | 每只 ETF 当月逐日累计/日收益率 |
-| 月度走势(兜底) | `https://stock2.1168168.xyz/api/etf/series?month=&days=15` | **无需认证** | 同上结构, 脚本自动降级使用 |
+| 走势数据 | `https://stock2.1168168.xyz/api/etf/month` | **必需 API Key** | 每只 ETF 逐日涨跌幅 (`percent`) |
 
-**自动降级**: 当 `month` 接口因缺少/过期 token 返回 401 时, 自动改用公开的
-`series` 接口 (同样返回 `symbol/name/series` 结构, 1648+ 只覆盖), 并在
-`sources.month.via` 标注 `series (公开兜底)`。
+### 走势接口的参数 (重要)
 
-### days 参数 (两个接口行为不同, 已实测)
+`month` 接口同时支持 `days` 与 `month` 两个参数, **`days` 优先于 `month`**:
 
-前端从 `localStorage["etf_analysis_days"]` 读 `days`, **默认 15**, 传给接口。
-但两个接口对 `days` 的处理实测存在差异 (2026-09-21 验证):
-
-| 接口 | days 是否生效 | 实测证据 |
+| 参数 | 语义 | 说明 |
 |---|---|---|
-| `month` (需认证) | 前端设计上生效 | 前端以 `f_({days: ue})` 调用; 无 token 无法实测 |
-| `series` (公开) | **不生效 (no-op)** | days 传 1/3/5/15/30/60, 返回字节数完全一致 (2302557), 逐字段相同 |
+| `days=N` | 最近 N 个**自然日** (跨月连续) | 默认 `days=15`; 服务端按自然日回溯 |
+| `month=YYYY-MM` | 该月**整月** | 一旦传了 `days`, `month` 会被忽略 |
 
-**`series` 返回语义**: 是「返回该月数据」而非「返回最近 N 天」。
-- 已结束月份 (如 2026-08) → 返回整月全部交易日 (21 天)
-- 进行中月份 (如 2026-09) → 返回该月截止目前 (中位 15 天)
-- **各 ETF 的 series 长度不一致** (实测 min 1 / max 15), 判断样本是否充足
-  必须用**中位数**, 不能用最大值
+因此脚本的策略是:
 
-脚本仍会把 `days` 传给两个接口 (对齐前端契约 + 兼容将来服务端启用截取),
-并输出 `month_trading_days` (中位数)、`month_days_min`、`month_days_max`。
+- **默认只传 `days=15`** —— 得到连续最近 15 个自然日的走势, 天然跨月, 不需要拼接
+- 用户显式要某个月时 (`--month 2026-08`) 才改传 `month`
+- 用户说「获取 30 天内的 ETF 数据」→ 传 `--days 30`
+
+返回结构 (按日期分组):
+
+```json
+{ "success": true,
+  "data": { "2026-09-21": [ {"symbol":"510300","name":"沪深300ETF","percent":1.25} ] } }
+```
+
+脚本会把它**转置**成按 ETF 分组、便于算指标的逐日走势 `trend`:
+
+```json
+{ "symbol":"510300", "name":"沪深300ETF",
+  "trend":[ {"trade_date":"2026-09-18","daily_return":0.0125,"cumulative_return":0.0125} ] }
+```
+
+`percent` 是**百分数** (1.25 = +1.25%), 脚本统一除以 100 存成小数, 与既有指标口径一致。
+
+### API Key 认证
+
+走势接口需要 API Key (形如 `etf_` + 64 位十六进制)。
+
+**获取方式**: 登录 `https://stock2.1168168.xyz/` → 用户菜单 → 「API Key 管理」→ 生成。
+
+**传递方式**: `Authorization: Bearer <key>` 请求头。
+
+**三种使用路径** (优先级从高到低):
+
+| 方式 | 命令 | 说明 |
+|---|---|---|
+| 命令行参数 | `--api-key "etf_xxx"` | 单次使用 |
+| 保存到配置 | `--api-key "etf_xxx" --save-api-key` | 写入 `~/.workbuddy-ai/etf-plugin/config.json`, 后续自动读取 |
+| 自动读取 | 无需参数 | 配置里已有 key 时自动使用 |
+
+**Key 是永久有效的**, 存明文, 不会过期 —— 但可能被用户在网站上**吊销**。
+若收到 401, 说明 key 无效或已被吊销, 需重新生成。
+
+> ⚠️ **不要**再把 Clerk JWT 当作认证手段 —— 那套方案 (60 秒 TTL、需要浏览器控制台
+> 手动取 token) 已被 API Key 取代。`--clerk-token` 参数与按月的 `series` 兜底接口均已移除。
 
 ### 快照缓存 (两类数据分开处理)
 
@@ -49,13 +79,17 @@ agent_created: true
 
 | 数据 | 文件 | 策略 |
 |---|---|---|
-| 月度走势 | `month_YYYY-MM.json` | **按月缓存**。同月再次运行直接复用, 不再调接口 |
+| 走势数据 | `month_d15.json` / `month_2026-08.json` | 按窗口缓存 (`d<days>` 或 `YYYY-MM`) |
 | 实时行情 | `live_YYYY-MM-DD.json` | **按天累积**。当日每次调用追加一条快照 |
 
-**月度缓存**:
+**走势缓存的文件名规则**:
+- 按 `--days` 查询 → `month_d15.json` / `month_d30.json` (按窗口区分)
+- 按 `--month` 查询 → `month_2026-08.json`
+
+**走势缓存**:
 - 命中条件: 缓存文件存在且未指定 `--refresh-month`
 - 写入条件: 需要 `--save-cache` (避免静默写盘)
-- 命中时 `sources.month.via` = `"按月缓存 (未重新拉取)"`
+- 命中时 `sources.month.via` = `"缓存 (d15, 未重新拉取)"`
 
 **实时快照累积**:
 - 默认开启 (每次运行都追加), 用 `--no-snapshot` 关闭
@@ -84,10 +118,10 @@ agent_created: true
 
 **16:01 后跳过实时接口是正当行为, 不是降级、不是妥协。**
 
-依据 (已实测): 月度 `series` 返回「该月截止目前的全部交易日」。16:00 落库后运行时,
-最后一条数据的 `trade_date` **就是当天** (实测 2026-09-21 三只样本均为当日),
-且带当日 `daily_return`。也就是说当日行情**已经在手边**, 再调实时接口是重复劳动
-—— 而且这个接口在代理/网络受限环境下会超时, 反而让整个采集误报失败。
+依据 (已实测): `month` 接口在 16:00 落库后, 当日行情就包含在返回数据中 (最后一条
+`trade_date` 就是当天), 且带当日 `percent`。也就是说当日行情**已经在手边**,
+再调实时接口是重复劳动 —— 而且这个接口在代理/网络受限环境下会超时, 反而让整个
+采集误报失败。
 
 实现要点:
 - 阈值常量: `MONTH_READY = 16:01`, 判断函数 `month_data_ready()`
@@ -124,51 +158,22 @@ agent_created: true
 说明 (如非交易时段), 不输出全 0 的空表。`intraday_diff.moved` 字段给出
 实际发生变化的品种数 (`climbing` / `falling` 两榜互斥, 不会出现同一只同时上榜)。
 
-### 月初自动补数 (自动拼接上一月)
+### 数据不足时自动扩大窗口
 
-**月份选择规则 (重要)**:
+`days` 是**自然日**而非交易日。若窗口内交易日太少 (比如遇上长假),
+动量与波动率会失真。
 
-脚本默认取 **当月** (`default_month()` = `datetime.now()` 的 `YYYY-MM`), 再由交易日
-数量决定是否需要回补上一月。**不要**把默认值写成「上月」—— 那样虽然看起来"数据更全",
-但会永远看不到当月数据, 且下面的补数逻辑再也不会触发 (因为上月通常已有 20+ 个交易日)。
+**触发条件**: 交易日中位数 `< max(days // 2, 3)`
 
-| 场景 | 默认取哪个月 | 是否拼接上一月 |
-|---|---|---|
-| 当月中旬 (如 9/21) | 2026-09 | 否 (当月已 15 个交易日 ≥ 10) |
-| 月初 (如 9/3) | 2026-09 | **是** (当月仅 2~3 天 < 10, 补 2026-08) |
-| 显式 `--month 2026-08` | 2026-08 | 由该月实际交易日数量决定 |
+**处理**: 自动把 `days` 翻倍重新拉取 (`15 → 30`), 得到更长窗口后替换。
+只有新窗口的交易日数**确实更多**才采纳, 否则保留原结果。
 
-**问题**: 月初跑分析时当月只有几天数据, 动量与波动率会失真。
+输出字段: `trading_days` (交易日中位数)、`trading_days_min`、`trading_days_max`。
 
-**解决**: 脚本检测到 `month_trading_days < min(days, 10)` 时, **自动抓取上一月
-数据并拼接**, 形成连续窗口。阈值 `min(days, 10)` 保证即使用户把 `days` 调很大,
-也不会在月中误触发拼接。
+用 `--no-stitch` 关闭自动扩大。
 
-| 字段 | 含义 |
-|---|---|
-| `month_trading_days` | 当月交易日中位数 |
-| `prev_month_stitched` | 拼接信息 `{prev_month, days_before, days_after}` |
-| `sources.month_prev` | 上一月数据的抓取状态 |
-
-用 `--no-prev-month` 可关闭自动拼接。
-
-> ⚠️ **拼接的关键坑**: 接口的 `cumulative_return` 是**月内累计**, 每月从 0 重新起算。
-> 直接拼接会导致跨月界跳变 (8月末 +15% 接 9月初 -1%), 使动量计算完全失真
-> (实测会算出 -20% 的假动量)。脚本因此**用 `daily_return` 逐日累乘重建连续的
-> 累计曲线**, 存为 `cumulative_return_cont`, 指标计算优先使用该字段。
-
-### Clerk 认证 (仅在需要走 month 接口时)
-
-前端在 axios 拦截器里给 `/api/*` 注入 `Authorization: Bearer <Clerk session JWT>`。
-没有有效 JWT 时返回 401 `{"success":false,"error":"未登录或登录已过期"}`。
-
-Clerk 配置 (从站点 bundle 提取):
-- Publishable Key: `pk_live_Y2xlcmsuMTE2ODE2OC54eXok`
-- Frontend API: `https://clerk.1168168.xyz`
-- 取 token: 登录站点后, 浏览器控制台执行 `await window.Clerk.session.getToken()`
-
-> ⚠️ **Clerk JWT 有效期仅 60 秒** (TTL `exp - iat = 60`)。必须在取到后立刻使用,
-> 否则必然 401。如果拿到就过期了, 直接用公开 `series` 兜底即可, 数据等价。
+**除非显式 `--month`, 否则不做跨月拼接** —— `days` 本身跨月连续, 不需要拼接。
+这也避免了旧实现的坑 (接口的累计值是**窗口内累计**, 拼接会造成跨月跳变)。
 
 ## 工作流程
 
@@ -178,51 +183,120 @@ Clerk 配置 (从站点 bundle 提取):
 **Python 解释器**: 用系统 `python3` / `python` 即可。若当前环境有专用
 解释器 (如 `.workbuddy-ai/binaries/...`), 用绝对路径调用最稳妥。
 
+### 第 0 步 — 确认 API Key (通常自动完成)
+
+走势接口需要 API Key, 但**大多数情况下脚本会自己搞定**:
+
+- 已有配置 → 自动读取, 无需任何操作
+- 没配置 → 脚本往 stderr 打印**可直接复制的配置命令**, 并从结果里带出
+  `"needs_api_key": true`
+
+**给 agent 的处理规则**: 若摘要里出现 `"needs_api_key": true`, 说明缺 Key。
+把 `api_key_page` 字段里的网址给用户, 让他生成后**把 Key 填进命令里**:
+
+```bash
+"$PY" "$SK/scripts/apikey_auth.py" etf_你的key     # 一行搞定, 无交互
+```
+
+> ⚠️ **不要依赖交互式输入** —— agent / CI 通过管道调用脚本时 stdin 不是终端,
+> 交互提示不会生效。请**始终用带参数的命令**, 或让用户自己去终端里跑。
+
+配置方式 (按可靠性排序):
+
+| 方式 | 命令 | 适用 |
+|---|---|---|
+| **直接传入 (首选)** | `python apikey_auth.py etf_xxx` | 一行搞定, agent 用这个 |
+| 管道传入 | `echo etf_xxx \| python apikey_auth.py` | 从变量/文件来 |
+| 环境变量 | `export ETF_API_KEY=etf_xxx` | CI/脚本, 不落盘 |
+| 交互式 | `python apikey_auth.py` | **仅限用户自己在终端里跑**; 支持粘贴/剪贴板 |
+
+`fetch_etf.py --setup` 等价于调用上面的交互式入口 (仅适合用户在终端里跑)。
+`--api-key "etf_xxx" --save-api-key` 仍然可用, 但已不是首选。
+
+**Key 粘贴容错**: 引号 (英文/中文)、首尾空格、`Bearer ` 前缀、多行内容、
+复制不全 —— 脚本都会自动清洗并校验, 有问题会明确告知差在哪里。
+
 ### 第 1 步 — 采集数据
 
 ```bash
 PY="python3"                                   # 或本机 python 的绝对路径
 SK="$HOME/.workbuddy-ai/skills/etf-analysis"   # 技能所在目录 (随安装位置调整)
 
-# 两个源都取 (token 从配置文件自动读取)
+# 默认: 最近 15 个自然日的走势 (API Key 从配置自动读取)
 "$PY" "$SK/scripts/fetch_etf.py" --out "$OUT/etf_data.json"
 ```
 
+**days 怎么定** (用户提到天数时按此调整):
+
+| 用户说法 | 参数 |
+|---|---|
+| 没说 / 默认 | `--days 15` (可省略) |
+| 「获取 30 天内的 ETF 数据」 | `--days 30` |
+| 「最近 60 天走势」 | `--days 60` |
+| 「看下 8 月的走势」 | `--month 2026-08` |
+
 常用参数:
-- `--month 2026-09` — 指定月份, **默认当月** (见下方说明)
-- `--days 15` — 月度窗口天数 (默认 15, 对齐前端 `etf_analysis_days`)
+- `--days N` — 走势窗口天数, **默认 15** (自然日, 跨月连续)
+- `--use-proxy` / `--no-proxy` — 强制走/不走系统代理。**默认自动**:
+  按系统代理配置先试一种, 连接层失败 (±10054 / SSL EOF) 则换另一种重试
+- `--month 2026-08` — 指定整月; **会覆盖 `--days`**
+- `--setup` — 进入 API Key 配置入口 (配完即退出, 不采集数据);
+  **仅适合用户在终端里跑** —— agent 请直接用 `apikey_auth.py etf_xxx`
+- `--api-key "etf_xxx"` — 手动传 API Key
+- `--save-api-key` — 把 Key 存进配置, 后续自动读取
 - `--cookie "<cookie>"` — 实时接口失败时的手动 cookie
-- `--clerk-token "<JWT>"` — 手动传 Clerk token (**必须在 60 秒内使用**)
-- `--no-prev-month` — 月初不自动拼接上一月数据
-- `--save-creds` — 把 cookie / token 写入 `~/.workbuddy-ai/etf-plugin/config.json`
+- `--no-stitch` — 数据不足时不自动扩大窗口
+- `--save-creds` — 把 cookie 写入配置文件
 - `--skip-month` / `--skip-live` — 只取单个源
 
 缓存相关:
-- `--save-cache` — 把月度走势写入按月缓存
-- `--refresh-month` — 忽略月度缓存, 强制重拉
+- `--save-cache` — 把走势数据写入缓存 (文件名按 `d<days>` 或月份区分)
+- `--refresh-month` — 忽略走势缓存, 强制重拉
 - `--no-snapshot` — 不追加当日实时快照
 - `--use-live-cache` — 盘中复用当日最后一条快照, 不重新拉实时行情
 - `--live-ttl MIN` — 盘中实时数据新鲜度阈值 (默认 10 分钟)
 - `--refresh-live` — 强制重新拉取实时数据 (跳过「月度已落库则跳过实时」与 TTL 判断)。
   ⚠️ **默认不要加这个参数**, 见下方「禁止事项」。
 
-脚本 stdout 会输出 JSON 摘要, 含 `sources` 状态、`month_trading_days` 与 `warnings`。
+脚本 **stdout** 输出 JSON 摘要, 含 `sources` 状态、`trading_days`、`warnings` 与
+`needs_api_key`。
+
+脚本 **stderr** 输出带 `[etf]` 前缀的进度日志, 形如:
+
+```
+[etf] 开始采集 (days=15)
+[etf] 已过 16:01, 走势数据已含当日行情 —— 跳过实时接口 (非必要)
+[etf] 走势数据未命中缓存, 开始拉取 (days=15)
+[etf] 走势数据 请求中 (代理, 第 1/2 次, 上限 10s)...
+[etf] 走势数据 已响应 HTTP 200
+[etf] 采集完成: 1674 条记录
+```
+
+**看到 `[etf]` 日志说明脚本在正常推进**; 若长时间停在某一行, 就是那一步在等网络,
+超时上限也写在日志里。这比没有任何输出地"卡住"可诊断得多。
 
 **失败处理**:
-- 月度接口失败会自动降级到公开 `series`, 通常无需干预。
-- 若 `month_trading_days < 10` → 月初数据不足, 脚本会尝试自动拼接上一月;
-  若拼接也失败, 需在分析里提示动量/波动率参考价值有限。
+- 若 `needs_api_key: true` → 缺 API Key, 按「第 0 步」处理
+  (交互环境下脚本通常已自动提示配置)。
+- 若走势接口返回 401 → Key 无效或已被吊销, 需重新生成。
+- 若 `trading_days < 10` → 样本不足, 脚本会自动扩大窗口重取;
+  若仍不足, 需在分析里提示动量/波动率参考价值有限。
+- 若报 `10054 远程主机强迫关闭连接` 或 `SSL: UNEXPECTED_EOF_WHILE_READING`
+  → 是**代理/网络通路**问题, 不是接口问题。脚本会自动换通路重试一次;
+  仍失败则用 `--no-proxy` 强制直连(或 `--use-proxy` 强制走代理) 再试。
+- **超时预算**: `--timeout` 类参数是**整次调用**的总预算, 自动重试会把预算
+  平摊给两种通路 (各占一半), 不会因为重试而翻倍。最坏情况:
+  实时约 12s、走势约 20s, 全程通常半分钟内结束。
 - 若实时源失败 (仅 16:01 前可能) → 向用户索要 cookie (浏览器 F12 → Network → 复制 Cookie 请求头)。
 - **16:01 后实时数据是不必要的** (`via` 为 `月度已落库, 跳过实时/复用快照 (实时非必要)`) ——
-  这是正常行为, 当日行情已在月度数据里。**不要**为了"拿实时数据"去加 `--refresh-live`。
-- token 过期属正常现象 (60 秒 TTL), 直接用兜底数据即可。
+  这是正常行为, 当日行情已在走势数据里。**不要**为了"拿实时数据"去加 `--refresh-live`。
 
 ### ⛔ 禁止事项 (重要)
 
 **任何情况下都不要给 `fetch_etf.py` 加 `--refresh-live`。**
 
 该参数会**强制跳过「月度已落库则跳过实时」逻辑**, 在 16:00 之后仍然去请求实时接口,
-而此时行情早已定格、且月度数据已含当日行情。后果是:
+而此时行情早已定格、且走势数据已含当日行情。后果是:
 
 1. 无谓的网络请求 —— 要的是一个已经在手边的数据, 纯属浪费
 2. 在代理/网络受限环境下**必然超时**, 反而让整个流程失败
@@ -283,21 +357,23 @@ ETF 代码需补交易所前缀: `515880` → `SH515880`, `159768` → `SZ159768
 读取 `analysis_prompt.md`, 按其中要求输出分析结论 (中文)。
 提示词模板本身写在 `prompts/prompt_template.md`, 可编辑。
 
-## 认证获取 (数据源 2, 可选)
+## 配置与凭据
 
-**通常不需要** —— 公开 `series` 接口已能提供等价的月度走势数据, 脚本会自动降级。
+所有本地状态都在 `~/.workbuddy-ai/etf-plugin/`:
 
-只有在必须走 `month` 接口时才需要 token, 且必须**立刻使用** (60 秒 TTL):
+| 文件 | 内容 |
+|---|---|
+| `config.json` | `api_key` (走势接口用)、`cookie` (实时接口备用) |
+| `cache/month_d15.json` | 按 `--days 15` 缓存的走势数据 |
+| `cache/month_2026-08.json` | 按 `--month` 缓存的走势数据 |
+| `cache/live_2026-09-21.json` | 当日的实时快照序列 |
 
-1. 浏览器打开 `https://stock2.1168168.xyz/` 并登录
-2. F12 → Console, 执行 `await window.Clerk.session.getToken()`
-3. **马上**交给脚本 (同一次操作内):
-   ```bash
-   "$PY" "$SK/scripts/fetch_etf.py" --out "$OUT/etf_data.json" \
-     --clerk-token "<JWT>" --save-creds
-   ```
+API Key 只在**首次**需要用户提供, 之后长期复用。配置方式见「第 0 步」。
 
-辅助脚本 `scripts/clerk_auth.py` 提供 `--token` 保存与 `--show-help` 说明。
+**环境变量**: 也支持用 `ETF_API_KEY` 传入 (优先级: 命令行 > 环境变量 > 配置文件)。
+适合 CI 或不想落盘的场景。
+
+Key 可在网站上随时吊销, 吊销后收到 401, 重新生成即可。
 
 ## 输出字段参考
 
@@ -305,11 +381,16 @@ ETF 代码需补交易所前缀: `515880` → `SH515880`, `159768` → `SZ159768
 - 实时: `symbol`, `name`, `current`, `percent`, `chg`, `amount`, `volume`,
   `premium_rate`, `unit_nav`, `acc_unit_nav`, `market_capital`, `followers`,
   `current_year_percent`, `total_shares`, `etf_types`
-- 派生: `month_return` (月内累计 %, 已 ×100), `momentum_5d` (%), `volatility`
+- 派生: `month_return` (窗口内累计 %, 已 ×100), `momentum_5d` (%), `volatility`
   (日收益标准差 %), `max_daily_drop`, `max_daily_gain`, `up_day_ratio`,
-  `liquidity_grade` (0-3), `tradable` (流动性够且有月度数据), `premium_risk`
+  `liquidity_grade` (0-3), `tradable` (流动性够且有走势数据), `premium_risk`
   (`low`/`mid`/`high`)
-- 月度: `month_series` = `[{trade_date, cumulative_return, daily_return}]`
+- 走势: `trend` = `[{trade_date, daily_return, cumulative_return}]`,
+  `trend_days` (该 ETF 的交易日数)
+
+顶层字段: `days`、`sources`、`warnings`、`data`、`total`、
+`trading_days` (交易日中位数)、`needs_api_key`。
+只有在 `--month` 时才有 `month` 字段。
 
 ## 注意事项
 
@@ -318,7 +399,8 @@ ETF 代码需补交易所前缀: `515880` → `SH515880`, `159768` → `SZ159768
   两者行为一致。
 - 输出路径请用**绝对路径**。Git Bash 下 `/tmp/x.json` 会被 Python 解读为
   相对路径 (落成字面量 `\tmp\x.json`), 用 `$HOME/...` 或 `C:/...` 更安全。
-- 数据源 2 的 `cumulative_return` 是小数 (0.052 = 5.2%), 脚本已统一换算为百分比。
+- 走势接口的 `percent` 是百分数 (1.25 = +1.25%), 脚本已统一换算成小数,
+  指标计算时再 ×100 转回百分比。
 - 实时接口偶发需要 cookie; 若返回非 JSON 内容, 大概率是被限流或需 cookie。
 - 该接口对 `Referer` 敏感, 脚本已带上 `https://stock2.1168168.xyz/`。
 - 所有本地状态 (配置 + 缓存) 都在 `~/.workbuddy-ai/etf-plugin/` 下,

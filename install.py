@@ -108,11 +108,12 @@ def run_doctor(src: Path) -> int:
     print("etf-analysis 环境体检 (doctor)")
     print("=" * 46)
     print("说明: 连通性受代理/防火墙/对端服务状态影响, 与安装无关。")
+    print("      走势接口需 API Key, 未配置时会返回 401 (不等于服务不可达)。")
     print()
 
     targets = [
         ("实时行情", "https://my-stock.918968.xyz/all"),
-        ("月度走势", "https://stock2.1168168.xyz/api/etf/series?month=2026-01&days=1"),
+        ("走势接口", "https://stock2.1168168.xyz/api/etf/month?days=1"),
     ]
     problems = 0
     for label, url in targets:
@@ -123,6 +124,13 @@ def run_doctor(src: Path) -> int:
             print(f"  [{'OK ' if reachable else 'FAIL'}] {label} 可达")
             if not reachable:
                 problems += 1
+        except urllib.error.HTTPError as exc:
+            # 401/403 说明服务本身可达, 只是缺 Key —— 这是预期状态, 不算问题
+            if exc.code in (401, 403):
+                print(f"  [OK ] {label} 可达 (HTTP {exc.code}: 需配置 API Key)")
+            else:
+                print(f"  [WARN] {label} 返回 HTTP {exc.code}")
+                problems += 1
         except Exception as exc:
             print(f"  [WARN] {label} 不可达: {exc}")
             problems += 1
@@ -132,7 +140,6 @@ def run_doctor(src: Path) -> int:
         print("全部数据源可达。")
     else:
         print(f"{problems} 个数据源当前不可达。这不影响使用 ——")
-        print("采集脚本运行时会自动降级重试 (month -> series 公开兜底)。")
         print("若持续失败, 请检查代理设置 (HTTPS_PROXY / NO_PROXY)。")
     # doctor 永不返回非零码: 体检结果不是错误
     return 0
@@ -212,8 +219,14 @@ def main() -> int:
     print("=" * 46)
     print("安装完成。")
     print()
+    print("首次使用前请配置 API Key (走势接口需要):")
+    print("  1. 登录 https://stock2.1168168.xyz/ 并进入「API Key 管理」生成")
+    print("  2. 保存:")
+    print(f'     python "{dest / "scripts" / "apikey_auth.py"}" --key "etf_xxx"')
+    print()
     print("使用方式:")
     print(f'  python "{dest / "scripts" / "fetch_etf.py"}" --out etf_data.json')
+    print(f'  python "{dest / "scripts" / "fetch_etf.py"}" --out etf_data.json --days 30')
     print()
     print("在 WorkBuddy 中直接说「用 ETF 分析技能分析我的持仓」即可。")
     print("如需体检数据源连通性: python install.py --doctor")
