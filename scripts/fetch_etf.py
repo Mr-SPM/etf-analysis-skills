@@ -19,19 +19,21 @@ A股 ETF 数据采集器 —— 合并两个数据源。
 数据源 2 (走势, 需 API Key):
     https://stock2.1168168.xyz/api/etf/month?days=15
     - 认证: Authorization: Bearer etf_xxxxx
-    - **days 优先于 month**: 传 days=N 返回最近 N 个自然日 (跨月连续);
-      传 month=YYYY-MM 返回该月整月 (会覆盖 days)
+    - 传 days=N 返回最近 N 个**自然日** (跨月连续) 的走势
     - 返回 {success, data: { <trade_date>: [ {symbol, name, percent} ] }}
     - percent 是百分数 (1.25 = +1.25%), 脚本统一换算成小数
     - 脚本会把按日分组的结构转成每只 ETF 的逐日走势 (trend)
 
+    注意: 接口路径里带 "month" 是历史命名。脚本**只传 days** ——
+    接口同时接受 days 与 month 且 days 优先, 同时传会让 month 被静默忽略,
+    所以这里干脆不支持 month 模式, 只保留"最近 N 个自然日"一种语义。
+
 用法:
     python fetch_etf.py --out out.json
     python fetch_etf.py --out out.json --days 30
-    python fetch_etf.py --out out.json --month 2026-08
     python fetch_etf.py --out out.json --api-key "etf_xxx" --save-api-key
     python fetch_etf.py --out out.json --cookie "<cookie string>"
-    python fetch_etf.py --out out.json --skip-month
+    python fetch_etf.py --out out.json --skip-trend
 """
 
 from __future__ import annotations
@@ -39,6 +41,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -53,7 +57,8 @@ except ImportError:
     requests = None  # 有则用 (连接池/重试更省心), 无则退回标准库
 
 LIVE_URL = "https://my-stock.918968.xyz/all"
-MONTH_URL = "https://stock2.1168168.xyz/api/etf/month"
+# 走势接口。路径里的 "month" 是服务端的历史命名, 语义上它是"走势"接口。
+TREND_URL = "https://stock2.1168168.xyz/api/etf/month"
 API_KEY_PREFIX = "etf_"
 DEFAULT_DAYS = 15
 CONFIG_PATH = Path.home() / ".workbuddy-ai" / "etf-plugin" / "config.json"
@@ -67,45 +72,100 @@ UA = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
+# 系统 curl 的路径 (存在则作为最后一条兜底通路)。见 _curl_get() 的说明。
+_CURL = shutil.which("curl")
+
 
 # --------------------------------------------------------------------------
 # 快照缓存
 # --------------------------------------------------------------------------
 # 两类数据分开处理:
-#   月度走势 (月内不变量) -> 按月缓存一个月一个文件, 命中则直接复用, 省接口调用
-#   实时行情 (日内变量)   -> 按天缓存, 当日每次调用**追加一条快照**, 形成日内序列
+#   走势数据 (窗口内不变量) -> 按窗口缓存 (trend_d<days>.json), 命中则复用
+#   实时行情 (日内变量)     -> 按天缓存, 当日每次调用**追加一条快照**, 形成日内序列
 # --------------------------------------------------------------------------
-def _cache_path_month(month: str) -> Path:
-    return CACHE_DIR / f"month_{month}.json"
+def _cache_path_trend(key: str) -> Path:
+    return CACHE_DIR / f"trend_{key}.json"
 
 
 def _cache_path_live(day: str) -> Path:
     return CACHE_DIR / f"live_{day}.json"
 
 
-def load_month_cache(month: str) -> list[dict] | None:
-    """读取按月缓存的走势数据。未命中返回 None。"""
-    p = _cache_path_month(month)
+def load_trend_cache(key: str) -> dict | None:
+    """读取走势缓存, 返回完整 payload (含 cached_at); 未命中返回 None。
+
+    返回整个 payload 而不是 rows, 是为了让调用方能拿到 ``cached_at``
+    判断新鲜度 —— 见 trend_cache_freshness()。
+    """
+    p = _cache_path_trend(key)
     if not p.exists():
         return None
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
-        rows = d.get("rows") or []
-        return rows or None
     except Exception:
         return None
+    return d if d.get("rows") else None
 
 
-def save_month_cache(month: str, rows: list[dict], source: str) -> None:
+def _trend_rows_look_valid(rows: list) -> bool:
+    """粗校验走势缓存记录的结构是否符合当前版本。
+
+    为什么必须有这一步: 缓存的字段名变过 (旧版叫 ``series``, 现在是 ``trend``)。
+    旧缓存被新版读取时**不会报错** —— ``r.get("trend")`` 直接拿到空列表,
+    于是所有 ETF 的走势天数变成 0、动量/波动率全部算不出来, 而调用方
+    只会看到一个"成功但没数据"的结果, 极难排查。
+
+    因此宁可把它当作**未命中**去重新拉取, 也不要静默使用一份结构不对的数据。
+    """
+    for r in rows:
+        if isinstance(r, dict) and "trend" in r:
+            return True
+    return False
+
+
+def trend_cache_freshness(
+    cached_at: str, now: datetime | None = None
+) -> tuple[bool, str]:
+    """判断走势缓存是否还能用。返回 (是否新鲜, 原因)。
+
+    走势数据是**按交易日**更新的: 当日数据 16:00 才落库。所以保鲜规则不是
+    "存了多久", 而是"有没有错过新数据":
+
+      - 跨天                              -> 过期 (新交易日必然产生新数据)
+      - 同一天, 但缓存在 16:01 前生成, 而现在已过 16:01
+                                          -> 过期 (16:00 落库了当日行情,
+                                             缓存里没有这一天)
+      - 其余                              -> 新鲜
+
+    没有这个判断时, 缓存的 ``cached_at`` 只写不读, 昨天存的 ``trend_d15``
+    会被今天直接复用 —— 用户会拿到**缺当天数据的旧结果**且毫无提示。
+    """
+    now = now or datetime.now()
+    try:
+        saved = datetime.fromisoformat(cached_at)
+    except Exception:
+        return False, "缓存时间无法解析"
+
+    if saved.date() != now.date():
+        return False, f"缓存来自 {saved.date()} 而非今日"
+
+    # 同一交易日内: 落库前后是两个不同的数据集
+    if saved.time() < TREND_READY <= now.time():
+        return False, "缓存在 16:00 落库前生成, 不含当日行情"
+
+    return True, "今日数据已落库"
+
+
+def save_trend_cache(key: str, rows: list[dict], source: str) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
-        "month": month,
+        "key": key,
         "source": source,
         "cached_at": datetime.now().isoformat(timespec="seconds"),
         "count": len(rows),
         "rows": rows,
     }
-    _cache_path_month(month).write_text(
+    _cache_path_trend(key).write_text(
         json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
 
@@ -157,10 +217,10 @@ def append_live_snapshot(day: str, rows: list[dict], label: str = "") -> dict:
 #   - >= 16:00   走势数据已含当日行情 -> 实时数据非必要, 可直接跳过
 #
 # 故阈值取 16:01 (16:00 落库 + 1 分钟缓冲, 避开落库瞬间的边界)。
-MONTH_READY = datetime.strptime("16:01", "%H:%M").time()
+TREND_READY = datetime.strptime("16:01", "%H:%M").time()
 
 
-def month_data_ready(now: datetime | None = None) -> bool:
+def trend_data_ready(now: datetime | None = None) -> bool:
     """走势数据是否已落库当日行情 (>= 16:01)。
 
     注意含义不是"收盘" —— 而是**走势数据已可替代实时数据**。
@@ -171,7 +231,7 @@ def month_data_ready(now: datetime | None = None) -> bool:
     行为等价且更省。
     """
     now = now or datetime.now()
-    return now.time() >= MONTH_READY
+    return now.time() >= TREND_READY
 
 
 def latest_snapshot_age(day: str) -> tuple[dict | None, float | None]:
@@ -356,6 +416,71 @@ def _raw_get(
         return 0, None, f"请求失败: {exc}"
 
 
+def _curl_get(
+    url: str,
+    headers: dict,
+    timeout: int,
+    use_proxy: bool = False,
+) -> tuple[int, bytes | None, str | None]:
+    """用系统 curl 发一次 GET, 返回 (status, body_bytes, error)。
+
+    为什么需要这条通路: 实测在**开了系统代理**的机器上, Python 的
+    urllib/requests 会在 TLS 握手阶段被断开
+    (``SSL: UNEXPECTED_EOF_WHILE_READING`` / ``WinError 10054``),
+    而 curl 用的是**另一套 TLS 栈** (Windows 上是 Schannel), 往往能正常拿到响应。
+
+    两者的失败模式并不重合, 而且**哪个能通并不稳定** (实测同一台机器上,
+    有时"curl 直连"能通, 有时"curl 走代理"才通)。所以 curl 这里也要
+    分别按代理/直连各试一次, 不能写死其中一种。
+
+    ``use_proxy=True`` 时不加 ``--noproxy``, 让 curl 自己读 ``https_proxy``
+    环境变量 —— 这与系统代理设置一致。
+
+    用 ``-w '\\n%{http_code}'`` 把状态码追加在响应体末尾, 这样单次进程调用
+    就能同时拿到 body 和 status, 不用发两次请求。
+    """
+    if not _CURL:
+        return 0, None, "curl 不可用"
+
+    cmd = [_CURL, "-sS", "--max-time", str(timeout), "-w", "\n%{http_code}"]
+    if not use_proxy:
+        cmd += ["--noproxy", "*"]
+    for k, v in (headers or {}).items():
+        cmd += ["-H", f"{k}: {v}"]
+    cmd.append(url)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout + 5,
+        )
+    except subprocess.TimeoutExpired:
+        return 0, None, f"curl 超时 (>{timeout}s)"
+    except Exception as exc:
+        return 0, None, f"curl 启动失败: {exc}"
+
+    out = proc.stdout or b""
+    stderr_txt = (proc.stderr or b"").decode("utf-8", "replace").strip()
+
+    if not out:
+        return 0, None, f"curl 失败: {stderr_txt or '无输出'}"
+
+    # 末尾一行是状态码
+    nl = out.rfind(b"\n")
+    if nl < 0:
+        return 0, None, "curl 输出异常 (缺少状态码)"
+    body, code_raw = out[:nl], out[nl + 1 :]
+    try:
+        code = int(code_raw.strip())
+    except ValueError:
+        return 0, None, "curl 状态码解析失败"
+    if code == 0:
+        # 连接层失败 (DNS/超时/TLS), curl 用 000 表示
+        return 0, None, f"curl 连接失败: {stderr_txt or 'unknown'}"
+    return code, body, None
+
+
 def _note(msg: str) -> None:
     """向 stderr 打进度。
 
@@ -382,12 +507,14 @@ def http_get_json(
     这是本技能可以零依赖分发到任意机器的基础。
 
     timeout 是**整次调用的总预算**, 不是每次尝试的预算 ——
-    自动重试会把预算平摊给两种通路, 绝不会因为重试而让总耗时翻倍。
+    自动重试会把预算平摊给各条通路, 绝不会因为重试而让总耗时翻倍。
 
     use_proxy:
-      - None (默认): **自动** —— 先按系统代理设置试一次, 连接层失败则换另一种
-        方式重试一次。因为该数据源在不同机器/不同时段对"直连 vs 代理"的
-        兼容性并不稳定 (实测两种都出现过失败), 写死任何一种都会偶发失败。
+      - None (默认): **自动** —— 依次尝试「urllib 代理 → urllib 直连 →
+        curl 代理 → curl 直连」, 任一拿到 HTTP 响应即停。之所以要覆盖到
+        两种传输层 × 两种代理模式, 是因为该数据源在不同机器/不同时段对
+        这四种组合的兼容性并不稳定 (实测哪个能通会随时间变化), 写死
+        任何一种都会偶发失败。
       - True / False: 强制走 / 不走代理, 不重试。
     """
     headers = headers or {}
@@ -397,31 +524,43 @@ def http_get_json(
         query = urllib.parse.urlencode(params)
         url = f"{url}{'&' if '?' in url else '?'}{query}"
 
-    # 决定尝试顺序
+    # 决定尝试顺序。每项是 (通路名, 传输层, 是否走代理)。
+    # 关键点: urllib 与 curl 是两套独立的 TLS 栈, 失败模式不重合, 所以要
+    # **两种传输层 × 两种代理模式**都覆盖到 —— 实测哪个能通会随时间变化,
+    # 写死任何一种都会偶发失败。
     if use_proxy is None:
-        # 系统配了代理就先试代理, 否则先试直连 —— 但两种都会兜底重试
         sys_proxy = bool(
             os.environ.get("HTTPS_PROXY")
             or os.environ.get("https_proxy")
             or os.environ.get("HTTP_PROXY")
             or os.environ.get("http_proxy")
         )
-        attempts = [sys_proxy, not sys_proxy]
+        order = [sys_proxy, not sys_proxy]
+        attempts: list[tuple[str, str, bool]] = [
+            ("代理" if p else "直连", "urllib", p) for p in order
+        ]
+        if _CURL:
+            attempts += [
+                ("curl 代理" if p else "curl 直连", "curl", p) for p in order
+            ]
     else:
-        attempts = [use_proxy]
+        attempts = [("代理" if use_proxy else "直连", "urllib", use_proxy)]
 
-    # 总预算平摊到每次尝试 (至少留 5 秒, 避免切得太碎)
-    per_try = max(5, int(timeout / len(attempts)))
+    # 总预算平摊到每次尝试 (至少留 6 秒, 避免切得太碎)
+    per_try = max(6, int(timeout / len(attempts)))
 
     last_err = "请求失败"
-    for idx, proxy_mode in enumerate(attempts, 1):
-        way = "代理" if proxy_mode else "直连"
+    for idx, (way, transport, proxy_mode) in enumerate(attempts, 1):
         if len(attempts) > 1:
             _note(f"{tag}请求中 ({way}, 第 {idx}/{len(attempts)} 次, 上限 {per_try}s)...")
         else:
             _note(f"{tag}请求中 ({way}, 上限 {per_try}s)...")
 
-        status, body, err = _raw_get(url, headers, per_try, proxy_mode)
+        if transport == "curl":
+            status, body, err = _curl_get(url, headers, per_try, use_proxy=proxy_mode)
+        else:
+            status, body, err = _raw_get(url, headers, per_try, proxy_mode)
+
         if status != 0:
             # 拿到 HTTP 响应 (含 4xx/5xx) —— 传输层成功, 交给上层判断
             _note(f"{tag}已响应 HTTP {status}")
@@ -502,19 +641,19 @@ def fetch_live(
 # --------------------------------------------------------------------------
 # 数据源 2: 走势数据 (API Key 认证)
 # --------------------------------------------------------------------------
-def fetch_month(
-    month: str = "",
+def fetch_trend(
     days: int = DEFAULT_DAYS,
     api_key: str = "",
-    timeout: int = 20,
+    timeout: int = 28,
     use_proxy: bool | None = None,
 ) -> tuple[list[dict], str | None]:
     """获取走势数据, 返回 (items, error)。
 
-    服务端行为 (见 api/etf/month.js):
-      - **days 优先于 month**: 传 days=N 时, 返回 [今天-N, 今天] 区间的数据 (可跨月)
-      - 只在未传 days 时才用 month, 返回该月整月
-      - 因此这里优先传 days, month 作为可选覆盖
+    只支持一种语义: **最近 N 个自然日** (可跨月连续)。
+
+    接口路径是 ``/api/etf/month``, 且它同时接受 ``days`` 与 ``month`` 两个参数,
+    其中 days 优先 —— 同时传时 month 会被**静默忽略**。既然脚本只需要
+    "最近 N 个自然日"这一种语义, 就**只传 days**, 从源头上避免这个歧义。
 
     返回结构: {success, data: { "<trade_date>": [ {symbol, name, percent}, ... ] }}
     本函数把「按日期分组」转换成「按 ETF 分组」的逐日走势, 便于后续指标计算:
@@ -533,16 +672,9 @@ def fetch_month(
         "Authorization": f"Bearer {api_key}",
     }
 
-    # days 优先; 未指定 days 时才回退到 month (兼容按月份查询)
-    params: dict[str, object] = {}
-    if days:
-        params["days"] = days
-    if month:
-        params["month"] = month
-
     status, payload, err = http_get_json(
-        MONTH_URL,
-        params=params,
+        TREND_URL,
+        params={"days": days},
         headers=headers,
         timeout=timeout,
         use_proxy=use_proxy,
@@ -613,8 +745,6 @@ def fetch_month(
             dedup[point["trade_date"]] = point
         item["trend"] = [dedup[k] for k in sorted(dedup)]
         _fill_cumulative(item["trend"])
-        item["data_type"] = "month"
-        item["days"] = len(item["trend"])
         items.append(item)
 
     return items, None
@@ -623,7 +753,7 @@ def fetch_month(
 def _pct(value) -> float | None:
     """把接口返回的百分比统一成小数 (5.2 -> 0.052)。
 
-    服务端 month 接口的 ``percent`` 是百分数 (1.25 表示 +1.25%),
+    服务端走势接口的 ``percent`` 是百分数 (1.25 表示 +1.25%),
     且**实测为字符串** (如 ``"6.08"``), 故这里用 float() 兜住字符串/数字两种形态。
     统一转成小数, 与既有指标口径一致。
     """
@@ -653,57 +783,94 @@ def _fill_cumulative(trend: list[dict]) -> None:
 # --------------------------------------------------------------------------
 # 推导指标 (为分析提供燃料)
 # --------------------------------------------------------------------------
-def derive_metrics(live: list[dict], month: list[dict]) -> list[dict]:
-    """把走势数据挂到实时行情上, 并计算动量/波动等指标。"""
-    # 走势索引
-    trend_map: dict[str, dict] = {}
-    for m in month:
-        sym = m.get("symbol")
+def _attach_trend_metrics(out: dict, trend: list[dict]) -> None:
+    """把一条走势序列的派生指标写进 out (就地修改)。
+
+    trend 为空也照样写 ``trend_days=0`` —— 下游用 ``r["trend_days"]``
+    做充分性检查, 缺字段会 KeyError, 所以**必须保证每个条目都有这个键**。
+    """
+    out["trend"] = trend
+    out["trend_days"] = len(trend)
+    if not trend:
+        return
+
+    rets = [
+        x.get("daily_return")
+        for x in trend
+        if isinstance(x.get("daily_return"), (int, float))
+    ]
+
+    # 累计收益: _fill_cumulative() 已用日收益逐日累乘重建,
+    # 是小数, 统一 ×100 转百分比。
+    cum = trend[-1].get("cumulative_return")
+    if isinstance(cum, (int, float)):
+        out["window_return"] = cum * 100
+    # 5 日动量: 用累计收益的两点差, 避免月界跳变
+    if len(trend) >= 6:
+        c_now = trend[-1].get("cumulative_return")
+        c_prev = trend[-6].get("cumulative_return")
+        if isinstance(c_now, (int, float)) and isinstance(c_prev, (int, float)):
+            out["momentum_5d"] = (c_now - c_prev) * 100
+    # 波动率 (日收益标准差, 百分化)
+    if len(rets) >= 3:
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        out["volatility"] = (var**0.5) * 100
+    # 最大单日跌幅 / 涨幅
+    if rets:
+        out["max_daily_drop"] = min(rets) * 100
+        out["max_daily_gain"] = max(rets) * 100
+    # 上涨天数占比
+    if rets:
+        out["up_day_ratio"] = sum(1 for r in rets if r > 0) / len(rets) * 100
+
+
+def derive_metrics(live: list[dict], trend_rows: list[dict]) -> list[dict]:
+    """以**走势数据为主体**, 用实时行情覆盖当日字段, 再计算派生指标。
+
+    为什么以 trend 为主体: 分析的核心是走势 (动量/波动/上涨天数占比),
+    trend 才是不可替代的那份数据。实时行情只是给其中一部分品种补上
+    `current` / `amount` / `premium_rate` 这类**当日字段**。
+
+    16:01 后 live 为空属正常 (当日行情已在 trend 里), 此时每只 ETF
+    本身就是一条完整记录, 只是缺实时字段。
+    """
+    live_map: dict[str, dict] = {}
+    for r in live:
+        sym = r.get("symbol")
         if sym:
-            trend_map[sym] = m
+            live_map[sym] = r
 
-    merged = []
-    for row in live:
-        sym = row.get("symbol", "")
-        out = dict(row)
-        m = trend_map.get(sym)
-        if m:
-            s = m.get("trend") or []
-            out["trend"] = s
-            out["trend_days"] = len(s)
-            if s:
-                rets = [
-                    x.get("daily_return")
-                    for x in s
-                    if isinstance(x.get("daily_return"), (int, float))
-                ]
+    merged: list[dict] = []
+    seen: set[str] = set()
 
-                # 累计收益: _fill_cumulative() 已用日收益逐日累乘重建,
-                # 是小数, 统一 ×100 转百分比。
-                cum = s[-1].get("cumulative_return")
-                if isinstance(cum, (int, float)):
-                    out["month_return"] = cum * 100
-                # 5 日动量: 用累计收益的两点差, 避免月界跳变
-                if len(s) >= 6:
-                    c_now = s[-1].get("cumulative_return")
-                    c_prev = s[-6].get("cumulative_return")
-                    if isinstance(c_now, (int, float)) and isinstance(c_prev, (int, float)):
-                        out["momentum_5d"] = (c_now - c_prev) * 100
-                # 波动率 (日收益标准差, 百分化)
-                if len(rets) >= 3:
-                    mean = sum(rets) / len(rets)
-                    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
-                    out["volatility"] = (var**0.5) * 100
-                # 最大单日跌幅
-                if rets:
-                    out["max_daily_drop"] = min(rets) * 100
-                    out["max_daily_gain"] = max(rets) * 100
-                # 上涨天数占比
-                if rets:
-                    out["up_day_ratio"] = (
-                        sum(1 for r in rets if r > 0) / len(rets) * 100
-                    )
+    for m in trend_rows:
+        sym = m.get("symbol")
+        out = dict(m)
+
+        lv = live_map.get(sym) if sym else None
+        if lv:
+            # 只覆盖实时特有的键, 不碰 trend / name
+            for k, v in lv.items():
+                if k not in ("symbol", "name", "trend"):
+                    out[k] = v
+            seen.add(sym)
+        else:
+            # 有走势、无实时: 明确标记, 便于分析时说明当日字段缺失
+            out["no_live_quote"] = True
+
+        _attach_trend_metrics(out, m.get("trend") or [])
         merged.append(out)
+
+    # 实时有、走势没有的品种: 没有历史序列, 无法参与趋势分析。
+    # 仍然保留并标记 —— 静默丢弃会让用户持仓凭空消失且无从排查。
+    for r in live:
+        sym = r.get("symbol")
+        if sym and sym not in seen:
+            out = dict(r)
+            out["no_trend_data"] = True
+            merged.append(out)
+
     return merged
 
 
@@ -730,21 +897,80 @@ def run_api_key_setup() -> int:
         return 1
 
 
-def score_etfs(rows: list[dict], min_amount: float = 5e7) -> list[dict]:
-    """对 ETF 打分/打标签, 便于分析时筛选。"""
-    for r in rows:
-        liquidity = 0.0
-        amt = r.get("amount") or 0
-        if amt >= 1e9:
-            liquidity = 3
-        elif amt >= 3e8:
-            liquidity = 2
-        elif amt >= min_amount:
-            liquidity = 1
+def _backfill_today_percent(rows: list[dict], latest_date: str) -> int:
+    """16:01 之后没有实时行情, 用走势序列的最后一条补出**当日涨跌幅**。
 
-        r["liquidity_grade"] = liquidity
-        # 是否适合交易 (流动性够 + 有月度数据)
-        r["tradable"] = bool(liquidity >= 2 and r.get("trend"))
+    只补 ``percent`` —— ``current`` / ``amount`` / ``premium_rate`` 走势数据里
+    根本没有, 编不出来, 也不该编。
+
+    ⚠️ 必须校验交易日: 部分 ETF 当天没有记录 (停牌/无成交), 它们的 trend
+    最后一条**不是**最新交易日。直接取 ``trend[-1]`` 会把**上一天**的涨跌
+    当成今天 —— 实测有上百只如此, 会污染涨跌家数与涨幅榜。
+
+    返回补了多少条。
+    """
+    if not latest_date:
+        return 0
+    filled = 0
+    for r in rows:
+        if r.get("percent") is not None:
+            continue
+        trend = r.get("trend") or []
+        if trend and trend[-1].get("trade_date") == latest_date:
+            last = trend[-1].get("daily_return")
+            if last is not None:
+                r["percent"] = round(last * 100, 2)
+                r["percent_from_trend"] = True
+                filled += 1
+    return filled
+
+
+def _breadth(rows: list[dict]) -> dict:
+    """涨跌家数。当日无行情记录的品种单列, 不混进"平盘"。
+
+    把它算在 Python 里而不是留给分析端: "平盘" 与 "当天没有记录" 是两件事,
+    前者是 0%, 后者是**数据缺口**。混在一起会把缺口掩盖成"横盘"。
+    """
+    up = sum(1 for r in rows if (r.get("percent") or 0) > 0)
+    down = sum(1 for r in rows if (r.get("percent") or 0) < 0)
+    flat = sum(1 for r in rows if r.get("percent") == 0)
+    return {
+        "total": len(rows),
+        "up": up,
+        "down": down,
+        "flat": flat,
+        "no_data": len(rows) - up - down - flat,
+    }
+
+
+def score_etfs(rows: list[dict], min_amount: float = 5e7) -> list[dict]:
+    """对 ETF 打分/打标签, 便于分析时筛选。
+
+    ⚠️ ``amount`` 缺失时**不能当成 0**。16:01 之后脚本会跳过实时接口
+    (当日行情已在走势数据里), 此时**所有** ETF 都没有成交额。若按 0 处理,
+    会得出"全市场流动性极差、无一只可交易"的荒谬结论 —— 那是"未知",
+    不是"差"。因此缺失时写 ``liquidity_grade = None`` 且
+    ``liquidity_known = False``, 让分析端知道"这项没测"。
+    """
+    for r in rows:
+        amt = r.get("amount")
+        if isinstance(amt, (int, float)):
+            if amt >= 1e9:
+                liquidity = 3
+            elif amt >= 3e8:
+                liquidity = 2
+            elif amt >= min_amount:
+                liquidity = 1
+            else:
+                liquidity = 0
+            r["liquidity_grade"] = liquidity
+            r["liquidity_known"] = True
+            # 是否适合交易 (流动性够 + 有走势数据)
+            r["tradable"] = bool(liquidity >= 2 and r.get("trend"))
+        else:
+            r["liquidity_grade"] = None
+            r["liquidity_known"] = False
+            r["tradable"] = None  # 未知, 不下"不可交易"的结论
 
         # 溢价率风险
         prem = r.get("premium_rate")
@@ -771,14 +997,6 @@ def main() -> int:
         help=(
             f"走势窗口天数, 默认 {DEFAULT_DAYS}。"
             "服务端按自然日回溯 (跨月连续), 建议 15 / 30 / 60"
-        ),
-    )
-    ap.add_argument(
-        "--month",
-        default="",
-        help=(
-            "按整月查询 YYYY-MM (可选)。"
-            "注意: 一旦指定则**覆盖** --days, 返回该月全部数据"
         ),
     )
     ap.add_argument(
@@ -817,18 +1035,13 @@ def main() -> int:
         help="强制直连, 不走代理, 失败也不重试",
     )
     ap.add_argument("--skip-live", action="store_true", help="跳过实时接口")
-    ap.add_argument("--skip-month", action="store_true", help="跳过走势接口")
+    ap.add_argument("--skip-trend", action="store_true", help="跳过走势接口")
     ap.add_argument(
         "--save-creds",
         action="store_true",
         help="把本次 cookie 写入配置文件以便复用",
     )
     ap.add_argument("--top", type=int, default=0, help="仅输出成交额前 N 只(调试用)")
-    ap.add_argument(
-        "--no-stitch",
-        action="store_true",
-        help="走势数据不足时不自动向前回补 (仅按 --days 窗口取值)",
-    )
     ap.add_argument(
         "--snapshot",
         action="store_true",
@@ -846,13 +1059,15 @@ def main() -> int:
     )
     ap.add_argument(
         "--save-cache",
-        action="store_true",
-        help="把月度走势写入按月缓存 (下次同月直接复用)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="把走势数据写入当日缓存 (默认开启)。同一天内重复调用会直接复用, "
+        "不再请求接口; 用 --no-save-cache 关闭",
     )
     ap.add_argument(
-        "--refresh-month",
+        "--refresh-trend",
         action="store_true",
-        help="忽略月度缓存, 强制重新拉取",
+        help="忽略走势缓存, 强制重新拉取",
     )
     ap.add_argument(
         "--live-ttl",
@@ -865,8 +1080,8 @@ def main() -> int:
         "--refresh-live",
         action="store_true",
         help=(
-            "强制重新拉取实时数据, 跳过「月度已落库则跳过实时」与 TTL 判断。"
-            "注意: 16:00 后月度数据已含当日行情, 加此参数只会在网络受限时"
+            "强制重新拉取实时数据, 跳过「走势已落库则跳过实时」与 TTL 判断。"
+            "注意: 16:00 后走势数据已含当日行情, 加此参数只会在网络受限时"
             "超时失败。默认不要使用。"
         ),
     )
@@ -895,7 +1110,7 @@ def main() -> int:
     # stdin 不是终端, input() 要么拿不到输入、要么直接抛异常。
     # 因此这里不做交互询问, 只把"下一步该做什么"写清楚 (含可直接复制的命令),
     # 让 agent 把这段话转达给用户。
-    if not api_key and not args.skip_month:
+    if not api_key and not args.skip_trend:
         script_dir = Path(__file__).resolve().parent
         setup_cmd = f'python "{script_dir / "apikey_auth.py"}"'
         sys.stderr.write(
@@ -912,9 +1127,9 @@ def main() -> int:
         )
         sys.stderr.flush()
 
-    month = args.month
-    # 缓存键: 按 days 查询时用 "d15" 之类的短键, 避免与整月缓存互相污染
-    cache_key = month if month else f"d{args.days}"
+    # 缓存键: 只按 days 区分窗口 (d15 / d30 / d60 ...)。
+    # 脚本只支持"最近 N 个自然日"一种语义, 所以缓存键不需要再区分模式。
+    cache_key = f"d{args.days}"
 
     result: dict = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -923,18 +1138,16 @@ def main() -> int:
         "warnings": [],
         "data": [],
     }
-    if month:
-        result["month"] = month
     if not api_key:
         result["needs_api_key"] = True
         result["api_key_page"] = APIKEY_PAGE_HINT
 
     live: list[dict] = []
-    month_rows: list[dict] = []
+    trend_rows: list[dict] = []
 
     today = datetime.now().strftime("%Y-%m-%d")
 
-    _note(f"开始采集 (days={args.days}" + (f", month={month}" if month else "") + ")")
+    _note(f"开始采集 (days={args.days})")
 
     # --- 数据源 1: 实时行情 ---
     # 实时行情的取舍逻辑 (按时间段区分, 而不是"尽量少调"):
@@ -948,7 +1161,7 @@ def main() -> int:
     #
     # 16:01 后跳过是**正当行为**, 不是降级、不是妥协。若当日已有快照则顺带复用,
     # 作为补充信息 (可选), 但绝不因缺少实时数据而失败。
-    skip_live_due_close = not args.refresh_live and month_data_ready()
+    skip_live_due_close = not args.refresh_live and trend_data_ready()
 
     if args.skip_live:
         _note("已按 --skip-live 跳过实时行情")
@@ -956,30 +1169,25 @@ def main() -> int:
         _note("已过 16:01, 走势数据已含当日行情 —— 跳过实时接口 (非必要)")
 
     if not args.skip_live and skip_live_due_close:
-        # 走势数据已落库: 优先复用当日快照作为补充, 没有也完全不影响分析
-        last_snap, _age = latest_snapshot_age(today)
-        if last_snap:
-            live = last_snap.get("rows") or []
-            result["sources"]["live"] = {
-                "ok": True,
-                "count": len(live),
-                "via": "走势已落库, 复用快照 (实时非必要)",
-                "snapshot_time": last_snap.get("time"),
-            }
-            result["warnings"].append(
-                f"已过 16:00, 走势数据已含当日行情, 实时数据非必要, "
-                f"复用 {last_snap.get('time')} 的当日快照作为补充。"
-            )
-        else:
-            result["sources"]["live"] = {
-                "ok": True,
-                "count": 0,
-                "via": "走势已落库, 跳过实时 (实时非必要)",
-            }
-            result["warnings"].append(
-                "已过 16:00, 走势数据已含当日行情, 实时接口非必要, 已跳过。"
-                "当日行情完整包含在走势数据中, 不影响分析。"
-            )
+        # 16:01 之后: **不使用任何旧快照**。
+        #
+        # 快照是盘中某个时刻拍的, 价格/成交额都只是那一刻的值, 不是收盘值。
+        # 拿它当"当前数据"会让分析用上半场数据得出全天的结论 —— 而且字段齐全,
+        # 看起来完全正常, 极难发现。宁可明确地"没有实时字段", 也不要给错值。
+        #
+        # 当日行情已完整包含在走势数据 (trend) 里, 这是唯一可信来源。
+        live = []
+        result["sources"]["live"] = {
+            "ok": True,
+            "count": 0,
+            "via": "走势已落库, 跳过实时 (实时非必要)",
+        }
+        result["warnings"].append(
+            "已过 16:01, 当日行情已含在走势数据中, 未请求实时接口。"
+            "`percent` (当日涨跌幅) 已由走势序列补出, 可正常使用; "
+            "但**成交额、溢价率、当前价等字段不存在** —— "
+            "分析时不要编造这些数值, 也不要据此判断流动性。"
+        )
 
     elif not args.skip_live:
         # 盘中: 实时数据必要, 依次过三道闸门 (任一命中即复用, 不调接口)
@@ -1040,83 +1248,157 @@ def main() -> int:
                     for s in snaps
                 ]
 
-    # --- 数据源 2: 走势数据 (month 接口, API Key 认证) ---
+    # --- 数据源 2: 走势数据 (API Key 认证) ---
     #
-    # 服务端 days 优先于 month:
-    #   --days 15  -> 最近 15 个自然日 (跨月连续), 默认值
-    #   --month    -> 指定整月 (会覆盖 --days)
-    if args.skip_month:
-        _note("已按 --skip-month 跳过走势数据")
-    if not args.skip_month:
-        cached = None if args.refresh_month else load_month_cache(cache_key)
-        if cached:
+    # 只有一种语义: 最近 args.days 个自然日 (跨月连续)。
+    if args.skip_trend:
+        _note("已按 --skip-trend 跳过走势数据")
+    if not args.skip_trend:
+        # 缓存**总是读取**: 即使 --refresh-trend 要求忽略它, 也要留着做失败回退,
+        # 否则"强制刷新"反而会在接口挂掉时连旧数据都用不上, 直接空手而归。
+        cached_payload = load_trend_cache(cache_key)
+        cached_rows = None
+
+        if cached_payload:
+            rows = cached_payload.get("rows") or []
+            if not _trend_rows_look_valid(rows):
+                _note("走势缓存结构已过时 (缺少 trend 字段), 忽略并重新拉取")
+            elif args.refresh_trend:
+                _note("已按 --refresh-trend 忽略缓存, 强制重新拉取 (旧缓存保留作回退)")
+            else:
+                fresh, why = trend_cache_freshness(cached_payload.get("cached_at", ""))
+                if fresh:
+                    cached_rows = rows
+                else:
+                    _note(f"走势缓存已过期 ({why}), 重新拉取")
+
+        if cached_rows:
             _note(f"走势数据命中缓存 ({cache_key}), 不重新拉取")
-            month_rows = cached
-            result["sources"]["month"] = {
+            trend_rows = cached_rows
+            result["sources"]["trend"] = {
                 "ok": True,
-                "count": len(cached),
+                "count": len(cached_rows),
                 "via": f"缓存 ({cache_key}, 未重新拉取)",
+                "cached_at": cached_payload.get("cached_at"),
             }
         else:
             _note(f"走势数据未命中缓存, 开始拉取 (days={args.days})")
-            month_rows, err = fetch_month(
-                month=month,
+            trend_rows, err = fetch_trend(
                 days=args.days,
                 api_key=api_key,
                 use_proxy=args.use_proxy,
             )
 
             if not err:
+                # 默认落盘: 同一天内后续调用直接命中, 不再重复请求接口
                 if args.save_cache:
-                    save_month_cache(cache_key, month_rows, "month")
-                result["sources"]["month"] = {
+                    save_trend_cache(cache_key, trend_rows, "trend")
+                result["sources"]["trend"] = {
                     "ok": True,
-                    "count": len(month_rows),
-                    "via": f"month (days={args.days})" if not month else f"month ({month})",
+                    "count": len(trend_rows),
+                    "via": f"trend (days={args.days})",
                 }
                 if args.save_api_key and args.api_key:
                     save_api_key(args.api_key)
                     result["api_key_saved"] = str(CONFIG_PATH)
             else:
-                result["sources"]["month"] = {"ok": False, "error": err, "count": 0}
-                if not api_key:
-                    result["needs_api_key"] = True
-                result["warnings"].append(err)
+                # 拉取失败: 若有**结构可用**的旧缓存, 退回使用并明确标注可能过期。
+                # 这比返回空数据好得多 —— 空数据会让调用方误以为"今天没行情",
+                # 而实际上只是网络/接口抖动。
+                fallback = None
+                if cached_payload:
+                    cand = cached_payload.get("rows") or []
+                    if _trend_rows_look_valid(cand):
+                        fallback = cand
 
-    # --- 数据不足时向前回补: 直接拉长 days 窗口重取 ---
+                if fallback:
+                    _note(f"走势接口失败, 回退到旧缓存 ({cached_payload.get('cached_at')})")
+                    trend_rows = fallback
+                    result["sources"]["trend"] = {
+                        "ok": True,
+                        "stale": True,
+                        "count": len(fallback),
+                        "via": "过期缓存 (接口失败回退)",
+                        "cached_at": cached_payload.get("cached_at"),
+                    }
+                    result["warnings"].append(
+                        f"走势接口拉取失败 ({err}), 已回退到 "
+                        f"{cached_payload.get('cached_at')} 的旧缓存 —— "
+                        f"数据可能不含最新交易日, 请向用户说明。"
+                        "【请直接使用本结果】不要手工 curl 接口, "
+                        "也不要用实时数据替代走势数据 (后者没有历史序列, "
+                        "动量/波动率/上涨天数占比都无法计算)。"
+                    )
+                else:
+                    result["sources"]["trend"] = {"ok": False, "error": err, "count": 0}
+                    if not api_key:
+                        result["needs_api_key"] = True
+                    result["warnings"].append(
+                        f"{err}"
+                        "【请勿绕过脚本自行取数】不要手工 curl 接口 —— "
+                        "手工拼的数据没有 sources 标记、字段结构易错 (会写坏缓存), "
+                        "而且会绕过「16:01 后不请求实时接口」这条安全规则。"
+                        "请如实告知用户接口暂时不通, 建议稍后重试。"
+                    )
+
+    # --- 数据充分性统计 (只统计, 不再自动重取) ---
     #
-    # month 接口的 days 本身就能跨月, 所以「窗口不够就放大 days 再拉一次」,
-    # 不需要按月拼接。
-    if month_rows and not args.no_stitch and not month:
-        lens = sorted(len(r.get("trend") or []) for r in month_rows)
-        cur_days = lens[len(lens) // 2] if lens else 0
-        result["trading_days"] = cur_days
+    # 这里原本有一段「交易日不足就把 days 翻倍重取」的逻辑, 已**删除**。原因:
+    #
+    # 1. **逻辑上解决不了问题** —— days 是按自然日回溯的窗口, 翻倍只是把窗口
+    #    往更早的方向延伸。而"交易日不足"通常是**最近几天数据没更新**,
+    #    扩大窗口既补不回最近的数据, 又会拉进一堆更早的历史。
+    # 2. **代价很高** —— 一次重取要跑完整轮兜底通路 (最多 28s), 而收益近乎为零。
+    # 3. **污染缓存** —— 重取结果按 `d{days}` 键落盘, 于是 `trend_d15.json` 里
+    #    实际存的是 30 天的数据, 缓存键名与内容不符, 下次读出来对不上。
+    #
+    # 正确做法是**如实报告样本量**, 由调用方在分析里说明参考价值有限。
+    if trend_rows:
+        lens = sorted(len(r.get("trend") or []) for r in trend_rows)
+        result["trading_days"] = lens[len(lens) // 2] if lens else 0
         result["trading_days_min"] = lens[0] if lens else 0
         result["trading_days_max"] = lens[-1] if lens else 0
 
-        # 交易日中位数不足期望的一半 -> 数据可能未更新, 扩大窗口重取
-        if cur_days and cur_days < max(args.days // 2, 3):
-            wider = args.days * 2
-            _note(f"交易日仅 {cur_days} 个, 扩大到 days={wider} 重取")
-            wide_rows, wide_err = fetch_month(
-                days=wider, api_key=api_key, use_proxy=args.use_proxy
-            )
-            if wide_rows:
-                new_lens = sorted(len(r.get("trend") or []) for r in wide_rows)
-                new_days = new_lens[len(new_lens) // 2] if new_lens else 0
-                if new_days > cur_days:
-                    month_rows = wide_rows
-                    if args.save_cache:
-                        save_month_cache(cache_key, month_rows, "month")
-                    result["sources"]["month"]["count"] = len(month_rows)
-                    result["warnings"].append(
-                        f"走势数据仅 {cur_days} 个交易日, 已扩大到 days={wider} "
-                        f"重新获取 ({new_days} 个交易日)。"
-                    )
+    # --- 数据最新日期校验 (替代"只看钟点"的粗判) ---
+    #
+    # 原先判断"当日行情是否已可用"只看钟点 (>= 16:01)。但钟点只是**必要条件**,
+    # 不是充分条件 —— 服务端可能延迟落库, 或个别 ETF 当天本就没有记录。
+    # 只按时间判断, 就会把「上一交易日的涨跌」当成今天, 分析结论直接失真。
+    #
+    # 因此这里改为**以数据里真实存在的最大 trade_date 为准**, 并把它暴露出去,
+    # 让调用方能核对"我拿到的到底是什么时候的数据"。
+    if trend_rows:
+        latest = ""
+        for r in trend_rows:
+            for p in (r.get("trend") or []):
+                td = p.get("trade_date") or ""
+                if td > latest:
+                    latest = td
+        if latest:
+            result["data_latest_date"] = latest
+            if latest != today:
+                result["warnings"].append(
+                    f"⚠️ 走势数据最新只到 {latest}, **不含今日 ({today})** —— "
+                    f"当日行情尚未落库, 或该日无交易。"
+                    f"分析时不要把 {latest} 的涨跌当作今日表现, "
+                    f"并如实说明数据截止日期。"
+                )
 
     # --- 合并 ---
-    merged = derive_metrics(live, month_rows) if live else month_rows
+    # derive_metrics 已内建"实时为空则以走势为主体"的分支, 无需在外层判断
+    merged = derive_metrics(live, trend_rows)
     merged = score_etfs(merged)
+
+    # 16:01 后没有实时行情 -> 用走势补出当日涨跌幅, 并算好涨跌家数。
+    # 这两件事必须在这里做: 否则 16:01 之后跑出来的结果里
+    # `percent` 全是空的, 分析端只能看到"上涨 0 只 / 平盘 1676 只",
+    # 与事实完全相反 —— 属于"看起来成功但其实是空的"那类失真。
+    filled = _backfill_today_percent(merged, result.get("data_latest_date", ""))
+    if filled:
+        result["percent_from_trend_count"] = filled
+    result["breadth"] = _breadth(merged)
+    _pcts = [r["percent"] for r in merged if r.get("percent") is not None]
+    result["avg_percent"] = round(sum(_pcts) / len(_pcts), 2) if _pcts else None
 
     # 数据充分性检查: 用中位数, 避免个别品种掩盖整体样本不足
     day_counts = sorted(r["trend_days"] for r in merged if r.get("trend_days"))
@@ -1159,8 +1441,15 @@ def main() -> int:
         "sources": result["sources"],
         "warnings": result["warnings"],
     }
-    if month:
-        summary["month"] = month
+    # 让 agent 不必打开 JSON 文件就能核对样本量与数据截止日
+    if result.get("trading_days") is not None:
+        summary["trading_days"] = result["trading_days"]
+    if result.get("data_latest_date"):
+        summary["data_latest_date"] = result["data_latest_date"]
+    if result.get("breadth"):
+        summary["breadth"] = result["breadth"]
+    if result.get("avg_percent") is not None:
+        summary["avg_percent"] = result["avg_percent"]
     if result.get("needs_api_key"):
         summary["needs_api_key"] = True
         summary["api_key_page"] = APIKEY_PAGE_HINT

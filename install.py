@@ -24,10 +24,15 @@ import argparse
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 SKILL_NAME = "etf-analysis"
 HERE = Path(__file__).resolve().parent
+
+# 旧版本备份目录 —— **必须在 ~/.workbuddy-ai/skills/ 之外**。
+# 放在 skills/ 里面会让备份被当成一个技能加载 (见 install() 的说明)。
+BACKUP_ROOT = Path.home() / ".workbuddy-ai" / "skill-backups"
 
 
 def default_skill_root() -> Path:
@@ -64,8 +69,12 @@ def check_scripts(src: Path) -> bool:
 
 
 def check_required_layout(src: Path) -> bool:
-    """确认技能必备文件都在 (缺了装过去也是残缺的)。"""
-    required = ["SKILL.md", "prompts/prompt_template.md"]
+    """确认技能必备文件都在 (缺了装过去也是残缺的)。
+
+    只有 SKILL.md + 两个脚本 —— 技能**没有**提示词模板/中间渲染层,
+    分析由 agent 直接读 fetch_etf.py 产出的 JSON 完成。
+    """
+    required = ["SKILL.md", "scripts/fetch_etf.py", "scripts/apikey_auth.py"]
     ok = True
     for rel in required:
         good = (src / rel).is_file()
@@ -76,8 +85,14 @@ def check_required_layout(src: Path) -> bool:
 
 def check_no_hardcoded_paths(src: Path) -> bool:
     """确保没有把某一台机器的绝对路径写死。"""
+    # 与 install() 的 ignore 保持一致: 这些目录不会装进技能目录,
+    # 也就没有"技能里含硬编码路径"的问题 (工作区记忆里出现本机路径是正常的)。
+    SKIP_DIRS = {".git", "__pycache__", ".workbuddy-ai", "docs"}
     bad = []
     for f in list(src.rglob("*.py")) + list(src.rglob("*.md")):
+        rel = f.relative_to(src)
+        if SKIP_DIRS & set(rel.parts):
+            continue
         # 跳过安装器自身: 它的检测规则里就包含这些字面量
         if f.name == "install.py":
             continue
@@ -148,17 +163,42 @@ def run_doctor(src: Path) -> int:
 def install(src: Path, dest_root: Path) -> Path:
     dest = dest_root / SKILL_NAME
     if dest.exists():
-        backup = dest.with_name(dest.name + ".bak")
-        if backup.exists():
-            shutil.rmtree(backup)
+        # ⚠️ 备份**绝不能**放进 dest_root (= ~/.workbuddy-ai/skills)。
+        #
+        # 该目录下每个含 SKILL.md 的子目录都会被当成一个技能加载, 所以
+        # `skills/etf-analysis.bak/` 或 `skills/.backup/etf-analysis.<ts>/`
+        # 都会注册出**重复的技能** —— agent 可能翻到那份旧的 SKILL.md,
+        # 按已经废弃的流程干活 (实测发生过)。
+        #
+        # 因此备份统一放到 skills/ 之外的 skill-backups/, 且只保留最近一份。
+        if BACKUP_ROOT.exists():
+            for old in BACKUP_ROOT.glob(f"{SKILL_NAME}.*"):
+                shutil.rmtree(old, ignore_errors=True)
+        BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+        backup = BACKUP_ROOT / f"{SKILL_NAME}.{datetime.now():%Y%m%d_%H%M%S}"
         shutil.move(str(dest), str(backup))
-        print(f"  (已存在旧版本 -> 备份到 {backup.name})")
+        print(f"  (旧版本 -> {backup})")
 
     dest_root.mkdir(parents=True, exist_ok=True)
     shutil.copytree(
         src,
         dest,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"),
+        ignore=shutil.ignore_patterns(
+            "__pycache__",
+            "*.pyc",
+            ".git",
+            ".gitignore",
+            # 这些是**本仓库自己的**东西, 不属于技能本体:
+            # .workbuddy-ai/ 是工作区记忆, docs/ 是说明性材料, install.py 是安装器。
+            # 不排除的话会被整目录拷进技能目录, 而且记忆文件里的绝对路径
+            # 还可能让 check_no_hardcoded_paths 误报、挡住安装。
+            ".workbuddy-ai",
+            "docs",
+            "*.bak",
+            "_tmp_out",
+            # 开发自测脚本, 技能运行时用不到
+            "smoke_test.py",
+        ),
     )
     # 安装目录里不需要安装器自身
     stray = dest / "install.py"

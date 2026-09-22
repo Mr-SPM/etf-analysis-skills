@@ -9,6 +9,10 @@ etf_data.json
 prompt.md
 analysis_prompt.md
 
+# 本地测试产物
+_tmp_out/
+*_tmp/
+
 # 编辑器
 .vscode/
 .idea/

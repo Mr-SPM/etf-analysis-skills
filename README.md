@@ -1,13 +1,24 @@
 # etf-analysis — A股 ETF 分析技能
 
-调用两个数据源获取 A 股 ETF 行情与走势，结合你的持仓生成交易分析。
+调用数据源获取 A 股 ETF 走势（盘中额外取实时行情），结合你的持仓生成交易分析。
+
+**分工很明确**：Python 只负责把「最近 N 个自然日」的数据稳定拿回来，分析交给技能。
+**观察窗口由你决定** —— 脚本不会擅自扩大窗口，也不会替你改天数。
+**没有中间层** —— 脚本产出 JSON，技能直接读 JSON 分析，不存在提示词模板/渲染步骤。
 
 ## 特点
 
 - **零第三方依赖** — 只用 Python 标准库，任何 Python 3.9+ 环境直接可用，无需 pip install
 - **可移植** — 不含任何硬编码绝对路径，所有本地状态按 `Path.home()` 动态解析
-- **快照缓存** — 实时行情按天累积、走势数据按窗口缓存，连续对话不重复调接口
+- **观察窗口就是自然日** — `--days N` = 最近 N 个自然日（跨月连续），
+  你传多少就是多少，脚本不做自动扩容、不做跨月拼接
+- **一个脚本** — `fetch_etf.py` 采集，输出自描述 JSON（含涨跌家数、派生指标、警告）
+- **走势缓存** — 走势数据当日拉取一次即落盘复用（跨天或 16:00 落库后自动刷新），
+  连续对话不重复调接口
+- **按时间语义决定是否取实时** — 16:01 后当日行情已在走势数据里，实时接口直接跳过，
+  当日涨跌幅由走势序列补出
 - **API Key 认证** — 走势接口用 API Key，存一次即可长期复用，无需反复登录取 token
+- **四条网络通路自动兜底** — urllib/curl × 代理/直连，任一成功即停
 
 ## 安装
 
@@ -44,14 +55,13 @@ python install.py --doctor
 
 ## 手动安装
 
-不想用安装脚本的话，把 `SKILL.md`、`prompts/`、`scripts/` 三个部分复制到
-技能目录即可，不需要执行任何安装命令。
+不想用安装脚本的话，把 `SKILL.md` 和 `scripts/` 复制到技能目录即可，
+不需要执行任何安装命令。
 
 ```
 <技能目录>/etf-analysis/
 ├── SKILL.md
-├── prompts/prompt_template.md
-└── scripts/{fetch_etf.py, build_prompt.py, apikey_auth.py}
+└── scripts/{fetch_etf.py, apikey_auth.py}
 ```
 
 ## 使用
@@ -99,36 +109,38 @@ python scripts/fetch_etf.py --out etf_data.json
 # 要 30 天
 python scripts/fetch_etf.py --out etf_data.json --days 30
 
-# 看某个整月
-python scripts/fetch_etf.py --out etf_data.json --month 2026-08
+# 要 60 天
+python scripts/fetch_etf.py --out etf_data.json --days 60
 ```
 
-生成分析提示词（需先有持仓信息）：
+生成分析：
 
 ```bash
-python scripts/build_prompt.py --data etf_data.json \
-  --portfolio '515880:15000:+0.15,513400:23000:-1.08,159768:10000:+5.40' \
-  --out prompt.md
+# 采集（默认最近 15 个自然日）
+python scripts/fetch_etf.py --out etf_data.json
+
+# 然后直接读 etf_data.json 分析即可 —— 没有中间步骤
 ```
 
-在 WorkBuddy 中直接说「用 ETF 分析技能分析我的持仓」，会走完整流程。
+在 WorkBuddy 中直接说「用 ETF 分析技能分析我的持仓」，会走完整流程
+（采集 → 读取 JSON → 输出分析）。
 
 ## 常用参数
 
 | 参数 | 说明 |
 |---|---|
-| `--days N` | 走势窗口天数（自然日），默认 15 |
-| `--month YYYY-MM` | 指定整月；**会覆盖 `--days`** |
+| `--days N` | 走势窗口天数（**自然日**），默认 15 |
+| `--out PATH` | 输出 JSON（必填，建议用绝对路径） |
 | `--setup` | 进入 API Key 配置入口（不采集数据，需在终端里运行） |
 | `--api-key "etf_xxx"` | 手动传 API Key |
 | `--save-api-key` | 把 Key 存进配置，后续自动读取 |
-| `--no-stitch` | 数据不足时不自动扩大窗口 |
-| `--use-proxy` / `--no-proxy` | 强制走/不走系统代理。默认自动回退重试 |
-| `--refresh-live` | 强制重新拉取实时数据（跳过「月度已落库则跳过实时」与 TTL 判断） |
-| `--live-ttl MIN` | 实时数据新鲜度阈值，默认 10 分钟 |
-| `--refresh-month` | 忽略走势缓存，强制重拉 |
-| `--save-cache` | 把走势数据写入缓存 |
-| `--skip-live` / `--skip-month` | 只取单个数据源 |
+| `--use-proxy` / `--no-proxy` | 强制走/不走系统代理。默认自动依次尝试 urllib/curl × 代理/直连 四条通路 |
+| `--refresh-live` | 强制重新拉取实时数据。⚠️ 默认不要用：16:00 后行情已定格，加它只会在网络受限时超时 |
+| `--live-ttl MIN` | 盘中实时数据新鲜度阈值，默认 10 分钟 |
+| `--use-live-cache` | 盘中直接复用当日最后一条快照，不重新拉取 |
+| `--refresh-trend` | 忽略走势缓存强制重拉。⚠️ 不要凭猜测加，脚本会自己判断缓存是否过期 |
+| `--save-cache` / `--no-save-cache` | 走势数据是否落盘（**默认开启**，同一天内重复调用直接命中缓存） |
+| `--skip-live` / `--skip-trend` | 只取单个数据源 |
 | `--cookie "<cookie>"` | 实时接口失败时手动提供 |
 
 ## 数据源
@@ -142,7 +154,26 @@ python scripts/build_prompt.py --data etf_data.json \
 
 - 实时行情：可选 cookie，失败时可手动提供
 - 走势数据：走 **API Key** 认证（`Authorization: Bearer etf_...`），Key 永久有效
-- `days` 优先于 `month`，`days` 是**自然日**（跨月连续），默认 15
+- 走势接口的路径里带 `month` 是服务端的历史命名；它同时接受 `days` 与 `month`，
+  且 `days` 优先（同时传会让 `month` 被静默忽略）。脚本**只传 `days`**，
+  不支持整月模式
+- `days` 是**自然日**（跨月连续），默认 15
+
+### 什么时候会去取实时行情
+
+走势接口每天 **16:00** 才落库当日行情，所以：
+
+| 时段 | 实时接口 |
+|---|---|
+| < 16:01 | 必要（盘中行情在变；15:00~16:00 走势尚未落库，跳过会丢当天记录） |
+| ≥ 16:01 | **跳过** —— 当日行情已在走势数据里 |
+
+16:01 后：
+
+- `percent`（当日涨跌幅）**有** —— 脚本从走势序列补出，并标 `percent_from_trend: true`
+- `current` / `amount` / `premium_rate` **没有** —— 走势数据里根本没有这些字段，
+  这是预期行为，不是采集失败。此时 `liquidity_grade` / `tradable` 为 `null`
+  （表示"未知"，不是"流动性差"）
 
 ## 数据存放位置
 
@@ -150,8 +181,7 @@ python scripts/build_prompt.py --data etf_data.json \
 ~/.workbuddy-ai/etf-plugin/
 ├── config.json              # api_key / cookie
 └── cache/
-    ├── month_d15.json          # 走势数据，按 --days 窗口缓存
-    ├── month_2026-08.json      # 走势数据，按 --month 缓存
+    ├── trend_d15.json          # 走势数据，按 --days 窗口缓存
     └── live_YYYY-MM-DD.json    # 实时快照，按天累积
 ```
 

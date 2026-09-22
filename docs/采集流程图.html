@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ETF 采集逻辑流程图</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #2c2c2a;
+    --muted: #5f5e5a;
+    --line: #d3d1c7;
+    --panel: #fafaf8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 40px 24px 64px;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.7;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 500; margin: 0 0 6px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 36px; }
+  h2 { font-size: 15px; font-weight: 500; margin: 0 0 4px; }
+  .note { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+  section { margin-bottom: 44px; }
+  .card {
+    background: var(--panel);
+    border: 0.5px solid var(--line);
+    border-radius: 12px;
+    padding: 20px 16px 12px;
+  }
+  .card svg { display: block; width: 100%; height: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 8px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 0.5px solid var(--line); }
+  th { font-weight: 500; color: var(--muted); }
+  code {
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 12.5px;
+    background: #f1efe8;
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .foot { color: var(--muted); font-size: 12px; border-top: 0.5px solid var(--line); padding-top: 16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>ETF 采集逻辑流程图</h1>
+  <p class="sub">对应 <code>scripts/fetch_etf.py</code>（2026-09-22 修订版）。核心结论：16:01 之后实时接口一次都不该请求。</p>
+
+  <section>
+    <h2>一、两个决策：哪些请求必须发，哪些必须不发</h2>
+    <p class="note">采集分两条独立支线。实时行情只看时间；走势数据看缓存。</p>
+    <div class="card">
+      <svg viewBox="0 0 680 372" width="100%" role="img" xmlns="http://www.w3.org/2000/svg">
+        <title>ETF 采集决策流程：实时行情与走势数据</title>
+        <desc>20:00 调用时，实时行情因已过 16:01 直接跳过（零请求）；走势数据若当日缓存有效则复用，否则走四条通路兜底请求接口。</desc>
+        <defs>
+          <marker id="a1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </marker>
+        </defs>
+        <text x="40" y="26" font-size="14" font-weight="500" fill="#2c2c2a">采集时的两个决策：哪些请求必须发，哪些必须不发</text>
+        <rect x="250" y="44" width="180" height="44" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+        <text x="340" y="66" text-anchor="middle" dominant-baseline="central" font-size="13.5" font-weight="500" fill="#0C447C">开始采集</text>
+        <path d="M340 88 L340 96" fill="none" stroke="#888780" stroke-width="1.5"/>
+        <path d="M185 96 L495 96" fill="none" stroke="#888780" stroke-width="1.5"/>
+        <path d="M185 96 L185 110" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#a1)"/>
+        <path d="M495 96 L495 110" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#a1)"/>
+        <rect x="40" y="112" width="290" height="206" rx="16" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+        <text x="60" y="138" font-size="13.5" font-weight="500" fill="#2C2C2A">实时行情</text>
+        <rect x="80" y="152" width="210" height="52" rx="10" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+        <text x="185" y="178" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#633806">现在 ≥ 16:01 ?</text>
+        <path d="M185 204 L185 214" fill="none" stroke="#888780" stroke-width="1.5"/>
+        <path d="M115 214 L255 214" fill="none" stroke="#888780" stroke-width="1.5"/>
+        <path d="M115 214 L115 226" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#a1)"/>
+        <path d="M255 214 L255 226" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#a1)"/>
+        <rect x="60" y="228" width="110" height="64" rx="10" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+        <text x="115" y="251" text-anchor="middle" dominant-baseline="central" font-size="12" font-weight="500" fill="#04342C">是 · 跳过实时</text>
+        <text x="115" y="270" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">零请求</text>
+        <rect x="200" y="228" width="110" height="64" rx="10" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+        <text x="255" y="251" text-anchor="middle" dominant-baseline="central" font-size="12" font-weight="500" fill="#4A1B0C">否 · 盘中才拉</text>
+        <text x="255" y="270" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993C1D">过 TTL 闸门</text>
+        <rect x="350" y="112" width="290" height="206" rx="16" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+        <text x="370" y="138" font-size="13.5" font-weight="500" fill="#2C2C2A">走势数据</text>
+        <rect x="390" y="152" width="210" height="52" rx="10" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+        <text x="495" y="172" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#633806">结构有效 且 今日新鲜 ?</text>
+        <text x="495" y="190" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#854F0B">含 trend 字段 · 未跨天 · 未错过 16:00</text>
+        <path d="M495 204 L495 214" fill="none" stroke="#888780" stroke-width="1.5"/>
+        <path d="M425 214 L565 214" fill="none" stroke="#888780" stroke-width="1.5"/>
+        <path d="M425 214 L425 226" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#a1)"/>
+        <path d="M565 214 L565 226" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#a1)"/>
+        <rect x="370" y="228" width="110" height="64" rx="10" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+        <text x="425" y="251" text-anchor="middle" dominant-baseline="central" font-size="12" font-weight="500" fill="#04342C">是 · 复用缓存</text>
+        <text x="425" y="270" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">零请求</text>
+        <rect x="510" y="228" width="110" height="64" rx="10" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+        <text x="565" y="251" text-anchor="middle" dominant-baseline="central" font-size="12" font-weight="500" fill="#4A1B0C">否 · 请求接口</text>
+        <text x="565" y="270" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993C1D">4 条通路兜底</text>
+        <text x="40" y="344" font-size="12" fill="#5f5e5a">20:00 调用：实时一栏必然走「是 · 跳过」，全程零请求；走势一栏取决于当日缓存是否已落库。</text>
+      </svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>二、走势接口失败时的兜底链</h2>
+    <p class="note">两条传输层 × 两种代理模式全覆盖。哪个能通会随时间变化，因此不写死任何一种。</p>
+    <div class="card">
+      <svg viewBox="0 0 680 404" width="100%" role="img" xmlns="http://www.w3.org/2000/svg">
+        <title>走势接口的四条通路自动兜底</title>
+        <desc>请求接口时依次尝试 urllib 代理、urllib 直连、curl 代理、curl 直连，任一拿到 HTTP 响应即停止；全部失败则回退旧缓存并标记 stale。</desc>
+        <defs>
+          <marker id="a2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </marker>
+        </defs>
+        <text x="40" y="26" font-size="14" font-weight="500" fill="#2c2c2a">走势接口失败时：两条传输层 × 两种代理模式，依次兜底</text>
+        <rect x="250" y="44" width="180" height="44" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+        <text x="340" y="66" text-anchor="middle" dominant-baseline="central" font-size="13.5" font-weight="500" fill="#0C447C">请求走势接口</text>
+        <path d="M340 88 L340 96" fill="none" stroke="#888780" stroke-width="1.5"/>
+        <path d="M200 96 L340 96" fill="none" stroke="#888780" stroke-width="1.5"/>
+        <path d="M200 96 L200 102" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#a2)"/>
+        <rect x="100" y="104" width="200" height="152" rx="14" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+        <text x="116" y="122" font-size="12" fill="#5F5E5A">urllib（OpenSSL）</text>
+        <rect x="116" y="134" width="168" height="48" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+        <text x="200" y="158" text-anchor="middle" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#0C447C">① 走系统代理</text>
+        <rect x="116" y="190" width="168" height="48" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+        <text x="200" y="214" text-anchor="middle" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#0C447C">② 直连</text>
+        <path d="M300 180 L374 180" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#a2)"/>
+        <rect x="380" y="104" width="200" height="152" rx="14" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+        <text x="396" y="122" font-size="12" fill="#5F5E5A">curl（Schannel）</text>
+        <rect x="396" y="134" width="168" height="48" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+        <text x="480" y="158" text-anchor="middle" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#3C3489">③ 走系统代理</text>
+        <rect x="396" y="190" width="168" height="48" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+        <text x="480" y="214" text-anchor="middle" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#3C3489">④ 直连</text>
+        <path d="M480 256 L480 276" fill="none" stroke="#888780" stroke-width="1.5"/>
+        <path d="M210 276 L490 276" fill="none" stroke="#888780" stroke-width="1.5"/>
+        <path d="M210 276 L210 290" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#a2)"/>
+        <path d="M490 276 L490 290" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#a2)"/>
+        <rect x="100" y="292" width="220" height="64" rx="10" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+        <text x="210" y="315" text-anchor="middle" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#04342C">任一拿到 HTTP 响应</text>
+        <text x="210" y="334" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">立即停止并落盘缓存</text>
+        <rect x="380" y="292" width="220" height="64" rx="10" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+        <text x="490" y="315" text-anchor="middle" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#633806">四条全失败</text>
+        <text x="490" y="334" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#854F0B">回退旧缓存，标 stale: true</text>
+        <text x="40" y="382" font-size="12" fill="#5f5e5a">总预算 28s 平摊给 4 条通路（各约 7s），不会因重试翻倍；curl 与 urllib 是两套独立 TLS 栈，失败模式不重合。</text>
+      </svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>三、缓存保鲜规则</h2>
+    <p class="note">按交易日语义判断，而不是「存了多久」。</p>
+    <table>
+      <tr><th>情况</th><th>判定</th><th>原因</th></tr>
+      <tr><td>缓存来自别的日期</td><td>过期，重新拉取</td><td>新交易日必然产生了新数据</td></tr>
+      <tr><td>同一天，缓存在 16:01 前生成，而现在已过 16:01</td><td>过期，重新拉取</td><td>16:00 落库了当日行情，缓存里没有</td></tr>
+      <tr><td>同一天且数据已落库（或两者都在 16:01 前）</td><td>新鲜，直接复用</td><td>数据集没有变化</td></tr>
+    </table>
+    <p class="note" style="margin-top:14px">
+      另有一条前置校验：记录里必须含 <code>trend</code> 字段。旧版字段名是 <code>series</code>，
+      结构不匹配的缓存会被<strong>当作未命中</strong>而不是拿来用 —— 否则会静默退化成空数据。
+    </p>
+  </section>
+
+  <p class="foot">
+    查看「数据到底从哪来」只看输出里的 <code>sources.trend.via</code>：
+    <code>trend (days=15)</code> = 本次真的请求了接口；
+    <code>缓存 (d15, 未重新拉取)</code> = 复用缓存、零网络；
+    <code>过期缓存 (接口失败回退)</code> + <code>stale: true</code> = 接口失败后退回旧数据，必须向用户说明。
+  </p>
+
+</div>
+</body>
+</html>
