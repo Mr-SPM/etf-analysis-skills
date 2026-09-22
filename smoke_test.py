@@ -7,6 +7,8 @@
   2. 缓存结构校验 (旧字段名 series 应判为无效)
   3. 缓存保鲜规则 (跨天 / 16:01 前生成 / 同日已落库)
   4. score_etfs: 无成交额时不能报 0 分 / 不可交易
+  4b. premium_risk 阈值 —— 脚本是唯一定义处, 锁住 0.5 / 1.0
+  4c. 动量字段名 momentum_5trading_days (5 个交易日, 不是 5 个自然日)
   5. _backfill_today_percent: 必须校验交易日, 不能把上一天的涨跌当今天
   6. _breadth: "平盘" 与 "当天无记录" 必须分开
   7. fetch_trend: 缺 API Key 时直接返回错误, 不发请求
@@ -107,7 +109,60 @@ def test_score_etfs():
         )
 
 
-# --------------------------------------------------- 5. 当日涨跌幅回填
+# --------------------------------------------------- 4b. premium_risk 阈值
+def test_premium_risk():
+    """溢价风险分级是**脚本单方面定义**的, SKILL 只解释标签。
+
+    这里把阈值锁住 —— 一旦改动, 测试会失败, 提醒同步检查文档描述。
+    """
+    print("== 4b. premium_risk 阈值 (唯一定义处) ==")
+    check("PREMIUM_MID == 0.5", fetch_etf.PREMIUM_MID == 0.5,
+          f"实际 {fetch_etf.PREMIUM_MID}")
+    check("PREMIUM_HIGH == 1.0", fetch_etf.PREMIUM_HIGH == 1.0,
+          f"实际 {fetch_etf.PREMIUM_HIGH}")
+
+    cases = [
+        (0.0, "low"), (0.49, "low"),
+        (0.5, "mid"), (0.99, "mid"),
+        (1.0, "high"), (5.0, "high"),
+        (-0.6, "mid"),   # 折价同样有风险, 取绝对值
+        (-2.0, "high"),
+    ]
+    rows = [{"symbol": f"S{i}", "premium_rate": v} for i, (v, _) in enumerate(cases)]
+    fetch_etf.score_etfs(rows)
+    for r, (v, exp) in zip(rows, cases):
+        check(f"premium_rate={v} -> {exp}", r.get("premium_risk") == exp,
+              f"实际 {r.get('premium_risk')}")
+
+    # 没有 premium_rate 时不写这个字段 (16:01 后没有实时数据)
+    rows2 = [{"symbol": "X"}]
+    fetch_etf.score_etfs(rows2)
+    check("无 premium_rate -> 不写 premium_risk",
+          "premium_risk" not in rows2[0])
+
+
+# --------------------------------------------------------- 4c. 动量字段命名
+def test_momentum_name():
+    print("== 4c. 动量字段名 (必须是 5 个交易日, 不是 5 个自然日) ==")
+    seq = [(f"2026-09-{10 + i:02d}", 0.01) for i in range(6)]
+    out = {}
+    fetch_etf._attach_trend_metrics(out, trend(seq))
+    check("写出 momentum_5trading_days",
+          "momentum_5trading_days" in out, f"实际 {sorted(out)}")
+    check("不再有 momentum_5d", "momentum_5d" not in out)
+    # 6 个点、每日 +1% -> 两点差应为 5 次复利
+    expect = ((1.01**5) - 1) * 100
+    check("动量数值 = 5 个交易日复利",
+          abs(out["momentum_5trading_days"] - expect) < 1e-6,
+          f"实际 {out.get('momentum_5trading_days')} 期望 {expect}")
+
+    # 不足 6 个交易日 -> 不写这个字段
+    out2 = {}
+    fetch_etf._attach_trend_metrics(out2, trend([("2026-09-21", 0.01)]))
+    check("交易日不足 -> 不写动量", "momentum_5trading_days" not in out2)
+
+
+# ---------------------------------------------------------------- 5. 回填
 def test_backfill():
     print("== 5. _backfill_today_percent (必须校验交易日) ==")
     latest = "2026-09-22"
@@ -182,6 +237,9 @@ def test_e2e():
     check("每条都有 trend_days", all("trend_days" in x for x in rows))
     check("每条都有 window_return (不再是 month_return)",
           all(x.get("window_return") is not None for x in rows))
+    check("动量字段名为 momentum_5trading_days (不再是 momentum_5d)",
+          any("momentum_5trading_days" in x for x in rows)
+          and not any("momentum_5d" in x for x in rows))
     b = d.get("breadth") or {}
     check("breadth 家数自洽",
           b.get("up", 0) + b.get("down", 0) + b.get("flat", 0) + b.get("no_data", 0)
@@ -204,6 +262,8 @@ if __name__ == "__main__":
     test_rows_valid()
     test_freshness()
     test_score_etfs()
+    test_premium_risk()
+    test_momentum_name()
     test_backfill()
     test_breadth()
     test_no_api_key()

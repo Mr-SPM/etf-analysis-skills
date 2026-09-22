@@ -61,6 +61,12 @@ LIVE_URL = "https://my-stock.918968.xyz/all"
 TREND_URL = "https://stock2.1168168.xyz/api/etf/month"
 API_KEY_PREFIX = "etf_"
 DEFAULT_DAYS = 15
+
+# 溢价风险阈值 (单位: %)。**这里是唯一定义处** —— SKILL 只解释 low/mid/high,
+# 不重复定义阈值, 否则两边会漂移。
+PREMIUM_MID = 0.5   # |溢价率| >= 0.5% -> 注意溢价
+PREMIUM_HIGH = 1.0  # |溢价率| >= 1.0% -> 明确提示溢价风险
+
 CONFIG_PATH = Path.home() / ".workbuddy-ai" / "etf-plugin" / "config.json"
 CACHE_DIR = Path.home() / ".workbuddy-ai" / "etf-plugin" / "cache"
 
@@ -805,12 +811,26 @@ def _attach_trend_metrics(out: dict, trend: list[dict]) -> None:
     cum = trend[-1].get("cumulative_return")
     if isinstance(cum, (int, float)):
         out["window_return"] = cum * 100
-    # 5 日动量: 用累计收益的两点差, 避免月界跳变
+    # 动量: 最近 5 个**交易日**的累计涨跌幅。
+    #
+    # ⚠️ 名字必须写清是交易日间隔, 不是自然日 —— trend 序列里只有交易日,
+    # 相邻两点相隔的是 1 个交易日。叫 `momentum_5d` 会被误读成"最近 5 个自然日"。
+    #
+    # 用日收益逐日累乘, 而不是"累计收益的两点差": 后者等于
+    # (cum[-1] - cum[-6]), 隐含乘了 (1 + cum[-6]) —— 当窗口前半段涨跌幅较大时
+    # 会明显高估。例如前半段累计 +50%、最近 5 个交易日 +5% 时,
+    # 两点差给出 7.5%, 与"近 5 日涨跌幅"这个名字对不上。
     if len(trend) >= 6:
-        c_now = trend[-1].get("cumulative_return")
-        c_prev = trend[-6].get("cumulative_return")
-        if isinstance(c_now, (int, float)) and isinstance(c_prev, (int, float)):
-            out["momentum_5d"] = (c_now - c_prev) * 100
+        last5 = [
+            x.get("daily_return")
+            for x in trend[-5:]
+            if isinstance(x.get("daily_return"), (int, float))
+        ]
+        if len(last5) == 5:
+            acc = 1.0
+            for r in last5:
+                acc *= 1.0 + r
+            out["momentum_5trading_days"] = (acc - 1.0) * 100
     # 波动率 (日收益标准差, 百分化)
     if len(rets) >= 3:
         mean = sum(rets) / len(rets)
@@ -972,11 +992,19 @@ def score_etfs(rows: list[dict], min_amount: float = 5e7) -> list[dict]:
             r["liquidity_known"] = False
             r["tradable"] = None  # 未知, 不下"不可交易"的结论
 
-        # 溢价率风险
+        # 溢价率风险 —— **这里是阈值的唯一定义处**。
+        #
+        # SKILL 只负责解释 low/mid/high 的含义, **不再自己写阈值**。
+        # 两边各维护一套阈值的后果是: 改了这边忘了那边, 同一个溢价率
+        # 被 Python 判成 mid、被分析端按另一套阈值判成"无需提示"。
         prem = r.get("premium_rate")
         if isinstance(prem, (int, float)):
             r["premium_risk"] = (
-                "high" if abs(prem) >= 1.0 else "mid" if abs(prem) >= 0.3 else "low"
+                "high"
+                if abs(prem) >= PREMIUM_HIGH
+                else "mid"
+                if abs(prem) >= PREMIUM_MID
+                else "low"
             )
     return rows
 
@@ -1401,15 +1429,18 @@ def main() -> int:
     result["avg_percent"] = round(sum(_pcts) / len(_pcts), 2) if _pcts else None
 
     # 数据充分性检查: 用中位数, 避免个别品种掩盖整体样本不足
+    #
+    # ⚠️ 这里**只描述事实**, 不给"换更长周期"的建议 —— 窗口由用户决定,
+    # 分析端不得据此自行扩大 days。样本少只意味着指标确定性低。
     day_counts = sorted(r["trend_days"] for r in merged if r.get("trend_days"))
     if day_counts:
         actual_days = day_counts[len(day_counts) // 2]
         result["trading_days"] = actual_days
         if actual_days < 10:
             result["warnings"].append(
-                f"⚠️ 可用走势数据中位数仅 {actual_days} 个交易日 "
-                f"(窗口设定 {args.days} 天), 动量与波动率指标参考价值有限, "
-                "建议结合更长周期判断。"
+                f"窗口 {args.days} 个自然日内实际只含 {actual_days} 个交易日 "
+                f"(中位数), 样本偏少 —— 动量/波动率等指标的确定性较低, "
+                "分析时请降低这些指标的权重, 不要据此给出强结论。"
             )
 
     if args.top and args.top > 0:

@@ -42,6 +42,13 @@
 - `amount` 缺失 ≠ 流动性差：`liquidity_grade` / `tradable` 置 `None`
 - "平盘"（0%）与"当天无记录"必须分开统计（`breadth.flat` vs `breadth.no_data`）
 - **不自动扩大窗口**、不做跨月拼接、不做交易日补足
+- **阈值只在 Python 里定义一次**：`PREMIUM_MID = 0.5` / `PREMIUM_HIGH = 1.0`，
+  SKILL 只解释 `low`/`mid`/`high` 标签，**不写任何阈值数字**（否则两边漂移）
+- `momentum_5trading_days` = 最近 5 个 `daily_return` **逐日累乘**。
+  不要用"累计收益两点差"（隐含乘 `(1+cum[-6])`，会高估；实测 1361/1664 只受影响）
+- SKILL 里**不写 Python 实现细节**（代理/TLS/缓存路径/TTL/请求参数）；
+  AI **优先用 Python 算好的指标**，不自己重算（排序筛选不算重算）
+- 输出允许"**暂无明确新增仓位信号**"，不得为凑格式强行推荐
 
 ## 平台注意（WorkBuddy）
 
